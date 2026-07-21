@@ -1,0 +1,48 @@
+#!/bin/sh
+# pre-push — client-side enforcement for omega-system.
+#
+# Wired via `git config core.hooksPath hooks` (see hooks/README.md). Two jobs:
+#   1. Refuse any push whose target is `main` — every change lands via a PR.
+#   2. Run the fast local gates (fmt, clippy, test) before the network round-trip.
+#
+# This hook is the local "never push to main" enforcement.
+#
+# No-deps: pure POSIX sh — no pre-commit framework, no Node toolchain.
+
+set -eu
+
+# Job 1: block pushes targeting main. Git feeds one line per ref on stdin:
+#   <local ref> <local sha> <remote ref> <remote sha>
+# We match the *destination* ref, so every spelling of a push that lands on
+# main is caught (e.g. `git push origin HEAD:main`, a renamed local branch).
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+	case "$remote_ref" in
+	refs/heads/main)
+		echo "pre-push: refusing direct push to main — open a PR instead." >&2
+		exit 1
+		;;
+	esac
+done
+
+# Job 2: the fast local checks. Run the slower coverage gate separately.
+#
+# Build into a tree-local target dir, never the shared one post-checkout wires
+# up. Cargo's freshness check can't always tell which source tree built a cached
+# test binary, so `cargo test` through the shared dir may run a binary compiled
+# from *another* worktree's sources — and the push gate must always compile and
+# test the tree being pushed, not a sibling's. The first push per tree cold-builds
+# here; that is the accepted cost. fmt doesn't compile, but exporting uniformly
+# is simpler and harmless.
+CARGO_TARGET_DIR="$PWD/target-push"
+export CARGO_TARGET_DIR
+
+echo "pre-push: cargo fmt --check"
+cargo fmt --check
+
+echo "pre-push: cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
+
+echo "pre-push: cargo test"
+cargo test --locked
+
+echo "pre-push: all checks passed."
