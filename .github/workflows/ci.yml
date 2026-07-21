@@ -1,0 +1,90 @@
+name: CI
+
+# Runs on demand. README.md documents the equivalent local gate.
+on:
+  workflow_dispatch:
+
+# Least privilege: the workflow only reads repository content.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test · coverage (${{ matrix.os }})
+    # Local-first project targets macOS; ubuntu guards against Linux-only
+    # regressions (it already caught the shell pipeline-kill bug). fail-fast
+    # off so one platform's failure doesn't cancel the other's signal.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin the toolchain explicitly so the gate is deterministic. This is the
+      # single source of truth for the CI Rust version; bump it here.
+      - name: Install pinned toolchain
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal \
+            -c rustfmt,clippy,llvm-tools-preview
+          rustup default 1.94.1
+          rustc --version
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Hermetic: live-API tests are #[ignore]'d, so no secrets/network.
+      - name: Test
+        run: cargo test --locked
+
+      # Pinned for a deterministic coverage number (a value flickering across
+      # 99/100 would block merges spuriously).
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked --version 0.8.7
+
+      # Coverage gate: 100% of hermetic lines, scoped by the exclusion regex
+      # below. The excluded files are only those legitimately
+      # unreachable without live secrets or a real terminal:
+      #   - src/main.rs       thin process wiring; everything interactive
+      #                       lives behind the run_repl seam, which is covered
+      #   - src/**/*_live.rs  the raw ureq/stdin/confirm tails plus the
+      #                       #[ignore]'d live-API tests
+      # That exclusion is a standing blind spot — code added to an excluded
+      # file evades the gate silently. Rule: an excluded file may hold only
+      # the raw transport/TTY wiring and live tests; any other addition there
+      # is gate evasion and belongs in a covered module.
+      - name: Coverage (scoped 100% gate)
+        run: |
+          # Capture the status instead of letting `-e` kill the step, so the
+          # summary is published even when the gate fails; re-raised at the end.
+          status=0
+          cargo llvm-cov --summary-only \
+            --ignore-filename-regex '(^|/)src/main\.rs$|_live\.rs$' \
+            --fail-under-lines 100 > coverage.txt || status=$?
+          cat coverage.txt
+          # On a failing gate, name the exact uncovered lines — the summary
+          # table above only names the file. Reuses the run's profdata.
+          if [ "$status" -ne 0 ]; then
+            cargo llvm-cov report \
+              --ignore-filename-regex '(^|/)src/main\.rs$|_live\.rs$' \
+              --show-missing-lines | sed -n '/^Uncovered Lines:/,$p'
+          fi
+          {
+            echo '### Hermetic coverage (scoped 100% gate)'
+            echo ''
+            echo 'Gate: 100% of hermetic lines. Excluded from scope: `src/main.rs`'
+            echo 'and the `*_live.rs` modules (live-API/TTY tails, unreachable'
+            echo 'without secrets or a terminal).'
+            echo ''
+            echo '~~~'
+            tail -n 3 coverage.txt
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

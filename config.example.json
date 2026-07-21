@@ -1,0 +1,11 @@
+{
+  "provider": "anthropic",
+  "model": "replace-with-a-model-id",
+  "max_tokens": 4096,
+  "system": null,
+  "context_token_limit": 200000,
+  "max_turns": 10,
+  "effort": null,
+  "agents": [],
+  "confirm": "ask"
+}
