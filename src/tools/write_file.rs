@@ -74,7 +74,14 @@ impl ToolDef for WriteFileTool {
         let path = input["path"].as_str().unwrap();
         let content = input["content"].as_str().unwrap();
         let resolved = self.sandbox.resolve_for_write(path)?;
-        let before = file_preview::read_existing(&resolved)?;
+        // Execution replaces the symlink itself; review the contents currently
+        // observable through it, while retaining the sandbox check on its target.
+        let preview_path = if std::fs::read_link(&resolved).is_ok() {
+            self.sandbox.resolve(path)?
+        } else {
+            resolved
+        };
+        let before = file_preview::read_existing(&preview_path)?;
         file_preview::render(path, before.as_deref(), content).map(Some)
     }
 
@@ -151,6 +158,35 @@ mod tests {
             tool.confirmation_preview(&serde_json::json!({"path": "directory", "content": "x"}))
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_preview_preserves_in_root_symlink_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        fs::write(&target, "old\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let tool = WriteFileTool::new(sandbox_in(dir.path()));
+        let input = serde_json::json!({"path": "link", "content": "new\n"});
+        let preview = tool.confirmation_preview(&input).unwrap().unwrap();
+        assert!(preview.contains("-     1 | old\n+     1 | new"));
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        tool.run(input, &mut std::io::sink()).unwrap();
+        assert!(
+            !fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&link).unwrap(), "new\n");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old\n");
     }
 
     #[test]

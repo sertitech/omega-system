@@ -2,6 +2,7 @@
 
 use crate::display::escape_for_review;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 // A prompt must remain reviewable on a terminal. Reject large changes instead
@@ -14,15 +15,21 @@ const TOO_LARGE: &str = "change preview omitted because it exceeds the review li
 /// Read existing text without allowing a device, pipe, or huge file to hang or
 /// exhaust an interactive approval. Creation is the only missing-file case.
 pub(super) fn read_existing(path: &Path) -> Result<Option<String>, String> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
+    // Inspect the opened descriptor: a path may be replaced after sandbox
+    // resolution, and neither a FIFO nor a substituted symlink may be followed.
+    let (mut file, metadata) = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .and_then(|file| file.metadata().map(|metadata| (file, metadata)))
+    {
+        Ok(opened) => opened,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("cannot inspect file for preview: {e}")),
+        Err(e) => return Err(preview_read_error(e)),
     };
     if !metadata.is_file() {
         return Err("cannot preview a non-regular file".to_string());
     }
-    let mut file = std::fs::File::open(path).map_err(preview_read_error)?;
     read_source(&mut file).map(Some)
 }
 
@@ -201,6 +208,41 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn preview_rejects_symlinks_and_fifos_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("regular");
+        std::fs::write(&target, "before").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            read_existing(&link)
+                .unwrap_err()
+                .contains("cannot read file")
+        );
+        std::fs::remove_file(&target).unwrap();
+        assert!(
+            read_existing(&link)
+                .unwrap_err()
+                .contains("cannot read file")
+        );
+        let fifo = dir.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a valid NUL-terminated path in this test's tempdir.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(read_existing(&fifo)).unwrap();
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("FIFO preview must reject without waiting for a writer");
+        worker.join().unwrap();
+        assert!(result.unwrap_err().contains("non-regular"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unreadable_file_and_inaccessible_directory_fail_closed() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -215,6 +257,6 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o0)).unwrap();
         let result = read_existing(&file);
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(result.unwrap_err().contains("cannot inspect file"));
+        assert!(result.unwrap_err().contains("cannot read file"));
     }
 }
