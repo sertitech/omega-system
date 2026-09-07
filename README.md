@@ -74,6 +74,22 @@ tools. Useful commands include `/model`, `/effort`, `/agents`, `/save`,
 `/load`, `/sessions`, `/clear`, and `/quit`. Start with
 `omega-system --resume` to resume a saved session.
 
+## Working with larger files and conversations
+
+The `read_file` tool accepts an optional 1-based `offset` and a positive `limit`
+in lines. For example, `{"path":"src/agent/mod.rs","offset":101,"limit":80}`
+reads lines 101–180. Ranged results report the next offset or EOF; the 100 KB
+output cap still applies and identifies an incomplete final line when reached.
+
+Before every provider request, Omega checks a conservative UTF-8 byte estimate
+of the messages, system prompt, and tool definitions against the configured
+context limit and reply budget. It can shorten tool results in the outgoing
+request while preserving the full results in the session. Older conversation
+groups can be summarized before a new turn; a summary is committed only if the
+resulting request fits. If the prompt itself cannot fit, Omega reports a local
+error: use a shorter prompt, smaller file ranges, or `/clear`. This estimate is
+not an exact provider token count.
+
 ## Security model
 
 Omega is a local coding agent, not a containment system. Its dedicated
@@ -83,7 +99,16 @@ can access anything that user can access. The filesystem sandbox therefore
 does not confine an approved shell command.
 
 `confirm: "ask"` is the default and prompts before file writes, edits, or shell
-execution. Shell guardrails block several destructive command shapes, but they
+execution. File approvals show every changed line with line numbers and visible
+escapes for terminal controls. A change that exceeds the 16 KiB / 200-line
+preview limit is rejected with a request for smaller edits; existing source
+files larger than 8 MiB cannot be previewed. These review limits apply to
+interactive approval.
+
+Shell deadlines and cancellation cover both process execution and output
+collection, including pipes left open by descendants. Omega cleans up the shell
+process group when collection finishes or fails. Shell guardrails block several
+destructive command shapes, but they
 are best-effort static analysis rather than a complete shell parser. Review
 every proposed command before approving it, and run Omega only in projects and
 environments where you accept that trust boundary.
@@ -96,7 +121,8 @@ Install the pinned coverage tool once:
 cargo install cargo-llvm-cov --locked --version 0.8.7
 ```
 
-Then run the complete local gate:
+Pull requests and pushes to `main` run the gate on macOS and Linux. To run the
+same gate locally:
 
 ```sh
 cargo fmt --check
