@@ -1,5 +1,5 @@
-use super::ToolDef;
 use super::sandbox::Sandbox;
+use super::{ToolDef, file_preview};
 use crate::atomic_write::atomic_write_text;
 
 pub struct WriteFileTool {
@@ -69,6 +69,15 @@ impl ToolDef for WriteFileTool {
         input["path"].as_str().map(|p| format!("writing {p}"))
     }
 
+    fn confirmation_preview(&self, input: &serde_json::Value) -> Result<Option<String>, String> {
+        self.validate(input)?;
+        let path = input["path"].as_str().unwrap();
+        let content = input["content"].as_str().unwrap();
+        let resolved = self.sandbox.resolve_for_write(path)?;
+        let before = file_preview::read_existing(&resolved)?;
+        file_preview::render(path, before.as_deref(), content).map(Some)
+    }
+
     fn run(
         &self,
         input: serde_json::Value,
@@ -113,6 +122,35 @@ mod tests {
 
     fn sandbox_in(dir: &std::path::Path) -> Sandbox {
         Sandbox::rooted(dir.to_path_buf()).unwrap()
+    }
+
+    #[test]
+    fn write_previews_creations_and_overwrites_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WriteFileTool::new(sandbox_in(dir.path()));
+        let input = serde_json::json!({"path": "file", "content": "new\n"});
+        let created = tool.confirmation_preview(&input).unwrap().unwrap();
+        assert!(created.contains("create new file"));
+        assert!(created.contains("+     1 | new"));
+        assert!(!dir.path().join("file").exists());
+        fs::write(dir.path().join("file"), "old\n").unwrap();
+        let replaced = tool.confirmation_preview(&input).unwrap().unwrap();
+        assert!(replaced.contains("replace existing file"));
+        assert!(replaced.contains("-     1 | old\n+     1 | new"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("file")).unwrap(),
+            "old\n"
+        );
+        assert!(tool.confirmation_preview(&serde_json::json!({})).is_err());
+        assert!(
+            tool.confirmation_preview(&serde_json::json!({"path": "../escape", "content": "x"}))
+                .is_err()
+        );
+        fs::create_dir(dir.path().join("directory")).unwrap();
+        assert!(
+            tool.confirmation_preview(&serde_json::json!({"path": "directory", "content": "x"}))
+                .is_err()
+        );
     }
 
     #[test]

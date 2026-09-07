@@ -396,8 +396,14 @@ fn confirm_summary(name: &str, status: Option<&str>) -> String {
 /// silent approval. The gate being permanent means "always gated", not
 /// "always prompts".
 fn confirm_with(input: &mut dyn BufRead, err: &mut dyn Write, summary: &str) -> bool {
-    let _ = write!(err, "Allow {summary}? [y/N] ");
-    let _ = err.flush();
+    let displayed = if summary.contains('\n') {
+        write!(err, "{summary}\nAllow this change? [y/N] ")
+    } else {
+        write!(err, "Allow {summary}? [y/N] ")
+    };
+    if displayed.and_then(|()| err.flush()).is_err() {
+        return false;
+    }
 
     let mut line = String::new();
     if input.read_line(&mut line).is_err() {
@@ -1034,10 +1040,30 @@ impl Agent {
                     ));
                     continue;
                 }
+                let mut summary = confirm_summary(name, status.as_deref());
+                if self.confirm.mode() == crate::config::ConfirmMode::Ask {
+                    match tool.confirmation_preview(input) {
+                        Ok(Some(preview)) => {
+                            // Put review text in the prompt itself: a child's
+                            // ordinary output may still be buffered when it asks.
+                            summary = format!("{summary}\n{}", sanitize_multiline(&preview));
+                        }
+                        Ok(None) => {}
+                        Err(reason) => {
+                            self.budget.release(cost);
+                            self.meta_line(
+                                out,
+                                format_args!("preview error: {}", sanitize_multiline(&reason)),
+                            );
+                            slots.push(rejected(id, reason));
+                            continue;
+                        }
+                    }
+                }
                 let call = ConfirmCall {
                     tool: name,
                     input,
-                    summary: &confirm_summary(name, status.as_deref()),
+                    summary: &summary,
                     request: initiating.as_deref(),
                 };
                 match self.confirm.decide(&call) {
@@ -3132,6 +3158,86 @@ mod tests {
         let (_, content, is_error) = expect_tool_result(&results[0]);
         assert_eq!(content, "wrote something");
         assert!(!is_error);
+    }
+
+    #[test]
+    fn file_approval_receives_full_preview_before_mutation_and_can_decline() {
+        use crate::tools::{edit_file::EditFileTool, sandbox::Sandbox, write_file::WriteFileTool};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, "old\n").unwrap();
+        let sandbox = Sandbox::rooted(dir.path().to_path_buf()).unwrap();
+        let mut agent = agent_with_tools(vec![
+            Box::new(WriteFileTool::new(sandbox.clone())),
+            Box::new(EditFileTool::new(sandbox)),
+        ]);
+        let inspected_path = path.clone();
+        agent.set_confirm_policy(ask_stub(move |summary| {
+            assert!(summary.contains("-     1 | old\n+     1 | new"));
+            assert_eq!(std::fs::read_to_string(&inspected_path).unwrap(), "old\n");
+            false
+        }));
+        let call = Block::ToolUse {
+            id: "preview".to_string(),
+            name: "write_file".to_string(),
+            input: serde_json::json!({"path": "file", "content": "new\n"}),
+        };
+        let results = agent.execute_tools(&[call], &mut std::io::sink());
+        assert!(expect_tool_result(&results[0]).2);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n");
+        let inspected_path = path.clone();
+        agent.set_confirm_policy(ask_stub(move |summary| {
+            assert!(summary.contains("-     1 | old\n+     1 | new"));
+            assert_eq!(std::fs::read_to_string(&inspected_path).unwrap(), "old\n");
+            true
+        }));
+        let call = Block::ToolUse {
+            id: "edit".to_string(),
+            name: "edit_file".to_string(),
+            input: serde_json::json!({"path": "file", "old_str": "old", "new_str": "new"}),
+        };
+        let results = agent.execute_tools(&[call], &mut std::io::sink());
+        assert!(!expect_tool_result(&results[0]).2);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+    }
+
+    #[test]
+    fn oversized_preview_rejects_without_prompt_or_write_and_releases_budget() {
+        use crate::tools::{sandbox::Sandbox, write_file::WriteFileTool};
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WriteFileTool::new(Sandbox::rooted(dir.path().to_path_buf()).unwrap());
+        let mut agent = agent_with_tools(vec![Box::new(tool)]);
+        agent.budget.set_limit(2, 1);
+        let prompts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prompt_count = prompts.clone();
+        agent.set_confirm_policy(ask_stub(move |_| {
+            prompt_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }));
+        let call = |content: String| Block::ToolUse {
+            id: "write".to_string(),
+            name: "write_file".to_string(),
+            input: serde_json::json!({"path": "file", "content": content}),
+        };
+        let large = "x".repeat(20 * 1024);
+        let results = agent.execute_tools(&[call(large.clone())], &mut std::io::sink());
+        let (_, text, error) = expect_tool_result(&results[0]);
+        assert!(error && text.contains("preview omitted") && text.contains("smaller edits"));
+        assert_eq!(prompts.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(!dir.path().join("file").exists());
+        let results = agent.execute_tools(&[call("small".to_string())], &mut std::io::sink());
+        assert!(!expect_tool_result(&results[0]).2);
+        assert_eq!(prompts.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // The display cap does not silently become a write-size cap for an
+        // explicitly unattended policy, which still receives the exact input.
+        agent.budget.set_limit(2, 2);
+        agent.set_confirm_policy(allow_stub());
+        let results = agent.execute_tools(&[call(large.clone())], &mut std::io::sink());
+        assert!(!expect_tool_result(&results[0]).2);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("file")).unwrap(),
+            large
+        );
     }
 
     #[test]
@@ -6382,6 +6488,47 @@ mod tests {
             String::from_utf8(err).unwrap(),
             "Allow shell: $ rm -rf src? [y/N] "
         );
+    }
+
+    #[test]
+    fn confirm_with_displays_multiline_preview_and_fails_closed_if_display_breaks() {
+        let mut err = Vec::new();
+        assert!(confirm_with(
+            &mut &b"y\n"[..],
+            &mut err,
+            "write file\n- old\n+ new"
+        ));
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "write file\n- old\n+ new\nAllow this change? [y/N] "
+        );
+        struct BrokenDisplay {
+            fail_flush: bool,
+        }
+        impl Write for BrokenDisplay {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.fail_flush {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::Error::other("display broke"))
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("flush broke"))
+            }
+        }
+        for fail_flush in [false, true] {
+            let mut input = &b"y\n"[..];
+            assert!(!confirm_with(
+                &mut input,
+                &mut BrokenDisplay { fail_flush },
+                "preview\n+ change"
+            ));
+            assert_eq!(
+                input, b"y\n",
+                "do not consume approval when the preview was not displayed"
+            );
+        }
     }
 
     // ── confirm_summary ──

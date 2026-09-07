@@ -1,4 +1,5 @@
 pub mod edit_file;
+mod file_preview;
 pub mod list_directory;
 pub mod read_file;
 pub mod sandbox;
@@ -79,6 +80,14 @@ pub trait ToolDef: Send + Sync {
     /// Override to display tool-specific context (e.g. the URL being fetched).
     fn format_status(&self, _input: &serde_json::Value) -> Option<String> {
         None
+    }
+
+    /// Complete review text for an interactive approval. Called only in `ask`
+    /// mode, before the prompt; errors reject the call without asking. Tools
+    /// must reject previews that omit changed text rather than invite approval
+    /// of unseen content. Automated policies continue judging the exact input.
+    fn confirmation_preview(&self, _input: &serde_json::Value) -> Result<Option<String>, String> {
+        Ok(None)
     }
 
     /// Whether this tool draws a permit from the process-wide fan-out
