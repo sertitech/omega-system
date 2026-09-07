@@ -14,6 +14,7 @@ mod budget;
 mod concurrency;
 mod confirm;
 mod confirm_live;
+mod context;
 #[cfg(test)]
 mod tests_live;
 
@@ -143,6 +144,8 @@ pub enum AgentError {
     /// terminal to notice a model re-trying denied variants forever, so the
     /// loop stops itself instead of burning provider calls against a wall.
     ConfirmBreaker,
+    /// Non-reducible prompt content exceeds the conservative request budget.
+    ContextLimit(u32),
 }
 
 impl std::fmt::Display for AgentError {
@@ -153,6 +156,10 @@ impl std::fmt::Display for AgentError {
                 write!(f, "agent exceeded maximum of {limit} turns")
             }
             AgentError::Cancelled => write!(f, "turn cancelled"),
+            AgentError::ContextLimit(limit) => write!(
+                f,
+                "request cannot fit context_token_limit {limit}; use a shorter prompt, smaller read_file ranges, or /clear"
+            ),
             AgentError::ConfirmBreaker => write!(
                 f,
                 "confirmation circuit breaker: {CONFIRM_BREAKER_LIMIT} consecutive automated \
@@ -1223,16 +1230,15 @@ impl Agent {
     /// `provider.send()` call, fold the result into the rolling summary, and
     /// drop those messages.
     ///
-    /// The guard is reactive by one turn — the only token signal is
-    /// post-response — and fires only here, between user turns. Two accepted
-    /// blind spots follow, both caught on the *next* turn: the first turn
-    /// after startup or `/clear` runs unguarded (`last_input_tokens` is 0), and
-    /// one `run()` can grow the context mid-tool-loop past any threshold
-    /// (compacting mid-loop is deliberately not attempted — it risks orphaning
-    /// a `tool_result` from its `tool_use`).
+    /// Summaries run between user turns, using measured usage and the current
+    /// raw history size. Within a turn, every outbound request independently
+    /// fits its tool-result text to the budget without changing the history.
     fn maybe_compact(&mut self, out: &mut dyn Write) -> Result<(), AgentError> {
         let limit = self.config.context_token_limit as u64;
-        if (self.last_input_tokens as u64) * 100 < limit * COMPACT_THRESHOLD_PERCENT {
+        if (self.last_input_tokens as u64) * 100 < limit * COMPACT_THRESHOLD_PERCENT
+            && (context::input_size(&self.build_request()) as u64) * 100
+                < limit * COMPACT_THRESHOLD_PERCENT
+        {
             return Ok(());
         }
         // Nothing droppable (the history is all recent groups): skip. The
@@ -1260,7 +1266,7 @@ impl Agent {
         });
         let request = TurnRequest {
             model: self.config.model.clone(),
-            max_tokens: SUMMARIZE_MAX_TOKENS,
+            max_tokens: SUMMARIZE_MAX_TOKENS.min(self.config.context_token_limit / 4),
             system: Some(SUMMARIZE_SYSTEM.to_string()),
             messages,
             // The prefix may carry tool_use blocks, and requests containing
@@ -1276,6 +1282,7 @@ impl Agent {
         // One retry — no more — absorbs a transient blip (transport error or
         // malformed summary) before that policy applies; a second failure
         // surfaces unchanged, and nothing is drained.
+        let request = self.fit_request(request, out)?;
         let summary = self
             .summarize(&request)
             .or_else(|_| self.summarize(&request))
@@ -1580,6 +1587,26 @@ impl Agent {
         self.models_cache.as_deref()
     }
 
+    /// Check every outbound request, including tool-loop continuations and
+    /// summaries. Shortening only the outbound copy preserves the complete
+    /// session for recovery and never separates a tool call from its result.
+    fn fit_request(
+        &self,
+        request: TurnRequest,
+        out: &mut dyn Write,
+    ) -> Result<TurnRequest, AgentError> {
+        let (request, shortened) = context::fit_request(request, self.config.context_token_limit)?;
+        if shortened > 0 {
+            self.meta_line(
+                out,
+                format_args!(
+                    "context: shortened {shortened} tool results; full results retained in session"
+                ),
+            );
+        }
+        Ok(request)
+    }
+
     /// Inner loop factored out so `run` can conditionally roll back history on
     /// an error path — keeping the transcript when a side-effecting tool ran,
     /// truncating it otherwise.
@@ -1594,7 +1621,7 @@ impl Agent {
             if self.cancelled() {
                 return Err(AgentError::Cancelled);
             }
-            let request = self.build_request();
+            let request = self.fit_request(self.build_request(), out)?;
             let mut stream = self.provider.stream(&request).map_err(AgentError::Api)?;
             let result = self.process_stream(stream.as_mut(), out)?;
 
@@ -1714,7 +1741,7 @@ impl Agent {
     /// are ignored — the loop is over. A build/stream error propagates for
     /// [`Agent::salvage_at_wall`] to treat as a fallback trigger.
     fn wrap_up_reply(&mut self, out: &mut dyn Write) -> Result<String, AgentError> {
-        let request = self.build_request();
+        let request = self.fit_request(self.build_request(), out)?;
         let mut stream = self.provider.stream(&request).map_err(AgentError::Api)?;
         let result = self.process_stream(stream.as_mut(), out)?;
         Ok(text_of(&result.blocks))
@@ -4189,14 +4216,14 @@ mod tests {
         let mut agent = Agent::new(
             Box::new(MockProvider::new(vec![
                 first,
-                measured_text_stream("done", 150, 10),
+                measured_text_stream("done", 1500, 10),
             ])),
             AgentConfig {
                 provider_kind: ProviderKind::Anthropic,
                 model: crate::TEST_MODEL.to_string(),
                 max_tokens: 64,
                 system: None,
-                context_token_limit: 200,
+                context_token_limit: 2000,
                 effort: None,
                 max_turns: MAX_TURNS,
             },
@@ -4208,7 +4235,7 @@ mod tests {
 
         let printed = String::from_utf8(out).unwrap();
         assert!(
-            printed.contains("[usage: 150 in, 10 out · context: 150/200 (75%)]"),
+            printed.contains("[usage: 1,500 in, 10 out · context: 1,500/2,000 (75%)]"),
             "got: {printed}"
         );
         assert_eq!(printed.matches("[usage:").count(), 1);
@@ -5473,7 +5500,7 @@ mod tests {
         // one, and the dropped messages no longer exist to be resent.
         let provider = MockProvider::new(vec![text_stream("next")]).with_send_text("S1");
         let log = provider.send_log();
-        let mut agent = compaction_agent(Box::new(provider), 100);
+        let mut agent = compaction_agent(Box::new(provider), 10000);
         agent.messages[1].content.insert(
             0,
             Block::Thinking {
@@ -5481,7 +5508,7 @@ mod tests {
                 signature: "old_sig".to_string(),
             },
         );
-        agent.last_input_tokens = 75;
+        agent.last_input_tokens = 7500;
 
         agent.run("q3", &mut std::io::sink()).unwrap();
 
@@ -5505,12 +5532,12 @@ mod tests {
 
     #[test]
     fn run_compacts_at_threshold_and_folds_summary_into_system() {
-        // 75 measured tokens against a 100-token limit sits exactly on the
+        // 7,500 measured tokens against a 10,000-token limit sits exactly on the
         // 75% threshold — the guard fires at >=, not >.
         let provider = MockProvider::new(vec![text_stream("next")]).with_send_text("S1");
         let log = provider.send_log();
-        let mut agent = compaction_agent(Box::new(provider), 100);
-        agent.last_input_tokens = 75;
+        let mut agent = compaction_agent(Box::new(provider), 10000);
+        agent.last_input_tokens = 7500;
 
         let mut out = Vec::new();
         agent.run("q3", &mut out).unwrap();
@@ -5559,9 +5586,9 @@ mod tests {
         // recorded request must carry `effort: None` despite the agent's set.
         let provider = MockProvider::new(vec![text_stream("next")]).with_send_text("S1");
         let log = provider.send_log();
-        let mut agent = compaction_agent(Box::new(provider), 100);
+        let mut agent = compaction_agent(Box::new(provider), 10000);
         agent.set_effort(Some("high".to_string()));
-        agent.last_input_tokens = 75;
+        agent.last_input_tokens = 7500;
 
         agent.run("q3", &mut std::io::sink()).unwrap();
 
@@ -5577,8 +5604,8 @@ mod tests {
     fn run_below_threshold_does_not_compact() {
         let provider = MockProvider::new(vec![text_stream("next")]).with_send_text("S1");
         let log = provider.send_log();
-        let mut agent = compaction_agent(Box::new(provider), 100);
-        agent.last_input_tokens = 74; // one below the 75% threshold
+        let mut agent = compaction_agent(Box::new(provider), 10000);
+        agent.last_input_tokens = 7499; // one below the 75% threshold
 
         agent.run("q3", &mut std::io::sink()).unwrap();
 
@@ -5595,12 +5622,12 @@ mod tests {
         let provider = MockProvider::new(vec![text_stream("next")]);
         let log = provider.send_log();
         let mut agent = Agent::new(Box::new(provider), test_config(None), vec![]);
-        agent.config.context_token_limit = 100;
+        agent.config.context_token_limit = 10000;
         agent.messages.push(user_msg("q0"));
         agent.messages.push(assistant_msg("a0"));
         agent.messages.push(user_msg("q1"));
         agent.messages.push(assistant_msg("a1"));
-        agent.last_input_tokens = 90;
+        agent.last_input_tokens = 9000;
 
         agent.run("q2", &mut std::io::sink()).unwrap();
 
@@ -5618,11 +5645,11 @@ mod tests {
         let provider =
             MockProvider::new(vec![text_stream("r1"), text_stream("r2")]).with_send_text("S");
         let log = provider.send_log();
-        let mut agent = compaction_agent(Box::new(provider), 100);
+        let mut agent = compaction_agent(Box::new(provider), 10000);
 
-        agent.last_input_tokens = 80;
+        agent.last_input_tokens = 8000;
         agent.run("q3", &mut std::io::sink()).unwrap(); // first compaction
-        agent.last_input_tokens = 80; // re-arm: the next turn measured over
+        agent.last_input_tokens = 8000; // re-arm: the next turn measured over
         agent.run("q4", &mut std::io::sink()).unwrap(); // second compaction
 
         let log = log.borrow();
@@ -5642,15 +5669,15 @@ mod tests {
         // Settled decision: a failed summary sub-call surfaces as an API
         // error rather than silently sending the known-over-limit request.
         // It fails before the new input is recorded, so nothing changes.
-        let mut agent = compaction_agent(Box::new(ErrProvider), 100);
-        agent.last_input_tokens = 80;
+        let mut agent = compaction_agent(Box::new(ErrProvider), 10000);
+        agent.last_input_tokens = 8000;
 
         let result = agent.run("q3", &mut std::io::sink());
 
         assert!(matches!(result, Err(AgentError::Api(_))));
         assert_eq!(agent.messages.len(), 6); // all three groups intact, no "q3"
         assert!(agent.compacted_summary.is_none());
-        assert_eq!(agent.last_input_tokens, 80);
+        assert_eq!(agent.last_input_tokens, 8000);
     }
 
     #[test]
@@ -5662,8 +5689,8 @@ mod tests {
             .with_send_text("S1")
             .with_send_failures(1);
         let log = provider.send_log();
-        let mut agent = compaction_agent(Box::new(provider), 100);
-        agent.last_input_tokens = 80;
+        let mut agent = compaction_agent(Box::new(provider), 10000);
+        agent.last_input_tokens = 8000;
 
         agent.run("q3", &mut std::io::sink()).unwrap();
 
@@ -5682,8 +5709,8 @@ mod tests {
             .with_send_text("S1")
             .with_send_failures(2);
         let log = provider.send_log();
-        let mut agent = compaction_agent(Box::new(provider), 100);
-        agent.last_input_tokens = 80;
+        let mut agent = compaction_agent(Box::new(provider), 10000);
+        agent.last_input_tokens = 8000;
 
         let result = agent.run("q3", &mut std::io::sink());
 
@@ -5691,7 +5718,7 @@ mod tests {
         assert_eq!(log.borrow().len(), 2); // exactly one retry
         assert_eq!(agent.messages.len(), 6); // intact, no "q3"
         assert!(agent.compacted_summary.is_none());
-        assert_eq!(agent.last_input_tokens, 80);
+        assert_eq!(agent.last_input_tokens, 8000);
     }
 
     #[test]
@@ -5702,8 +5729,8 @@ mod tests {
         // including the one retry, which this shape also gets.
         let provider = MockProvider::new(vec![]).with_send_stop_reason(StopReason::MaxTokens);
         let log = provider.send_log();
-        let mut agent = compaction_agent(Box::new(provider), 100);
-        agent.last_input_tokens = 80;
+        let mut agent = compaction_agent(Box::new(provider), 10000);
+        agent.last_input_tokens = 8000;
 
         let result = agent.run("q3", &mut std::io::sink());
 
@@ -5719,8 +5746,8 @@ mod tests {
         // summary — an empty rolling summary would silently forget the
         // dropped context behind a bare header.
         let provider = MockProvider::new(vec![]).with_send_text("");
-        let mut agent = compaction_agent(Box::new(provider), 100);
-        agent.last_input_tokens = 80;
+        let mut agent = compaction_agent(Box::new(provider), 10000);
+        agent.last_input_tokens = 8000;
 
         let result = agent.run("q3", &mut std::io::sink());
 
@@ -5736,8 +5763,8 @@ mod tests {
         // snapshot is taken after it — so the failed turn rolls back to the
         // *compacted* history, and the summary keeps only the text block of
         // the sub-call's response.
-        let mut agent = compaction_agent(Box::new(SucceedThenErrProvider::new(vec![])), 100);
-        agent.last_input_tokens = 80;
+        let mut agent = compaction_agent(Box::new(SucceedThenErrProvider::new(vec![])), 10000);
+        agent.last_input_tokens = 8000;
 
         let result = agent.run("q3", &mut std::io::sink());
 
@@ -5766,6 +5793,95 @@ mod tests {
 
         assert!(system.starts_with("You are helpful."));
         assert!(system.ends_with("## Earlier conversation (summarized)\nold stuff"));
+    }
+
+    #[test]
+    fn tool_loop_checks_large_real_file_before_continuing() {
+        use crate::tools::{read_file::ReadFileTool, sandbox::Sandbox};
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("large.txt"), "word ".repeat(13_000)).unwrap();
+        let mut first = tool_use_stream("read", "read_file");
+        if let StreamDelta::ToolArgsDelta { json, .. } = &mut first[2] {
+            *json = serde_json::json!({"path": "large.txt"}).to_string();
+        }
+        let provider = MockProvider::new(vec![first, text_stream("read a narrower range")]);
+        let log = provider.stream_log();
+        let mut config = test_config(None);
+        config.context_token_limit = 8000;
+        let mut agent = Agent::new(
+            Box::new(provider),
+            config,
+            vec![Box::new(ReadFileTool::new(
+                Sandbox::rooted(directory.path().into()).unwrap(),
+            ))],
+        );
+        let mut output = Vec::new();
+        agent.run("read large.txt", &mut output).unwrap();
+        let log = log.borrow();
+        assert_eq!(log.len(), 2);
+        assert!(context::input_size(&log[1]) <= 6000);
+        let (id, content, error) = expect_tool_result(&log[1].messages[2].content[0]);
+        assert_eq!(id, "read");
+        assert!(!error);
+        assert!(content.contains("tool output shortened"));
+        assert_eq!(expect_tool_use(&log[1].messages[1].content[0]).0, id);
+        assert_eq!(
+            expect_tool_result(&agent.session().messages[2].content[0])
+                .1
+                .len(),
+            65_000
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("full results retained in session")
+        );
+    }
+
+    #[test]
+    fn oversized_first_input_fails_before_network_and_rolls_back() {
+        let provider = MockProvider::new(vec![]);
+        let log = provider.stream_log();
+        let mut agent = Agent::new(Box::new(provider), test_config(None), vec![]);
+        let error = agent
+            .run(&"x".repeat(100_000), &mut Vec::new())
+            .unwrap_err();
+        assert!(matches!(error, AgentError::ContextLimit(100_000)));
+        assert!(error.to_string().contains("smaller read_file ranges"));
+        assert!(log.borrow().is_empty());
+        assert!(agent.session().messages.is_empty());
+    }
+
+    #[test]
+    fn context_failure_preserves_tool_pairs_after_mutation_only() {
+        for mutates in [false, true] {
+            let first = text_and_tool_use_stream("call", "tool", &"x".repeat(8000));
+            let provider = MockProvider::new(vec![first]);
+            let log = provider.stream_log();
+            let tool = if mutates {
+                TestTool::new("tool", "changed").mutating()
+            } else {
+                TestTool::new("tool", "read")
+            };
+            let mut config = test_config(None);
+            config.context_token_limit = 8000;
+            let mut agent = Agent::new(Box::new(provider), config, vec![Box::new(tool)]);
+            assert!(matches!(
+                agent.run("work", &mut Vec::new()),
+                Err(AgentError::ContextLimit(8000))
+            ));
+            assert_eq!(log.borrow().len(), 1);
+            if mutates {
+                let session = agent.session();
+                assert_eq!(session.messages.len(), 3);
+                assert_eq!(
+                    expect_tool_result(&session.messages[2].content[0]).0,
+                    "call"
+                );
+            } else {
+                assert!(agent.session().messages.is_empty());
+            }
+        }
     }
 
     // ── clear ──
@@ -5970,7 +6086,7 @@ mod tests {
         let provider = MockProvider::new(vec![text_stream("next")]).with_send_text("S2");
         let log = provider.send_log();
         let mut agent = Agent::new(Box::new(provider), test_config(None), vec![]);
-        agent.config.context_token_limit = 100;
+        agent.config.context_token_limit = 10000;
 
         agent.restore(Session {
             version: crate::session::SESSION_VERSION,
@@ -5978,7 +6094,7 @@ mod tests {
                 .flat_map(|i| [user_msg(&format!("q{i}")), assistant_msg(&format!("a{i}"))])
                 .collect(),
             compacted_summary: Some("S1".to_string()),
-            last_input_tokens: 75,
+            last_input_tokens: 7500,
         });
 
         agent.run("q3", &mut std::io::sink()).unwrap();

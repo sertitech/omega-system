@@ -27,6 +27,7 @@ pub(crate) struct MockProvider {
     send_stop: StopReason,
     send_failures: Cell<u32>,
     send_log: Rc<RefCell<Vec<TurnRequest>>>,
+    stream_log: Rc<RefCell<Vec<TurnRequest>>>,
     models: Vec<String>,
     list_models_calls: Rc<Cell<usize>>,
 }
@@ -40,6 +41,7 @@ impl MockProvider {
             send_stop: StopReason::EndTurn,
             send_failures: Cell::new(0),
             send_log: Rc::default(),
+            stream_log: Rc::default(),
             models: Vec::new(),
             list_models_calls: Rc::default(),
         }
@@ -52,6 +54,7 @@ impl MockProvider {
             send_stop: StopReason::EndTurn,
             send_failures: Cell::new(0),
             send_log: Rc::default(),
+            stream_log: Rc::default(),
             models: Vec::new(),
             list_models_calls: Rc::default(),
         }
@@ -85,6 +88,10 @@ impl MockProvider {
         self.send_failures = Cell::new(n);
         self
     }
+    /// Capture the requests actually sent, including tool-loop continuations.
+    pub(crate) fn stream_log(&self) -> Rc<RefCell<Vec<TurnRequest>>> {
+        Rc::clone(&self.stream_log)
+    }
     /// A shared handle to the recorded `send` requests, cloned out before the
     /// provider is boxed into the agent.
     pub(crate) fn send_log(&self) -> Rc<RefCell<Vec<TurnRequest>>> {
@@ -105,7 +112,8 @@ impl Provider for MockProvider {
             usage: Usage::default(),
         })
     }
-    fn stream(&self, _request: &TurnRequest) -> Result<DeltaStream, ApiError> {
+    fn stream(&self, request: &TurnRequest) -> Result<DeltaStream, ApiError> {
+        self.stream_log.borrow_mut().push(request.clone());
         let deltas = if self.repeat {
             self.streams
                 .borrow()
