@@ -4,7 +4,7 @@
 //! Only tool-result text may be shortened. The complete session stays intact.
 
 use super::{AgentError, COMPACT_THRESHOLD_PERCENT};
-use crate::turn::{Block, TurnRequest};
+use crate::turn::{Block, Role, TurnMessage, TurnRequest};
 
 const OMITTED: &str =
     "\n[tool output shortened to fit context; request a smaller range or narrower query]";
@@ -25,6 +25,23 @@ pub(super) fn input_size(request: &TurnRequest) -> usize {
     )
 }
 
+/// Share the same output reserve with compaction's preflight decision.
+pub(super) fn input_budget(request: &TurnRequest, limit: u32) -> usize {
+    ((u64::from(limit) * COMPACT_THRESHOLD_PERCENT / 100) as usize)
+        .min(limit.saturating_sub(request.max_tokens) as usize)
+}
+
+/// Keep continuation text attached to a pending tool-result message.
+pub(super) fn append_input(messages: &mut Vec<TurnMessage>, input: &str) {
+    match messages.last_mut() {
+        Some(last) if last.role == Role::User => last.content.push(Block::Text(input.to_string())),
+        _ => messages.push(TurnMessage {
+            role: Role::User,
+            content: vec![Block::Text(input.to_string())],
+        }),
+    }
+}
+
 /// Fit the outbound copy without breaking tool pairing or rewriting the
 /// operator's instructions. Large results lose their suffix first; if the
 /// non-reducible content alone exceeds the budget, no request is sent.
@@ -32,8 +49,7 @@ pub(super) fn fit_request(
     mut request: TurnRequest,
     limit: u32,
 ) -> Result<(TurnRequest, usize), AgentError> {
-    let budget = ((u64::from(limit) * COMPACT_THRESHOLD_PERCENT / 100) as usize)
-        .min(limit.saturating_sub(request.max_tokens) as usize);
+    let budget = input_budget(&request, limit);
     let mut shortened = 0;
     while input_size(&request) > budget {
         let excess = input_size(&request) - budget;
@@ -42,11 +58,7 @@ pub(super) fn fit_request(
             .iter_mut()
             .flat_map(|message| &mut message.content)
             .filter_map(|block| match block {
-                Block::ToolResult { content, .. }
-                    if content.len() > OMITTED.len() && !content.ends_with(OMITTED) =>
-                {
-                    Some(content)
-                }
+                Block::ToolResult { content, .. } if content.len() > OMITTED.len() => Some(content),
                 _ => None,
             })
             .max_by_key(|content| content.len());
@@ -164,6 +176,14 @@ mod tests {
             fit_request(request(vec![result("x".repeat(1000))]), 100),
             Err(AgentError::ContextLimit(100))
         ));
+    }
+
+    #[test]
+    fn tool_text_cannot_impersonate_internal_shortening_state() {
+        let request = request(vec![result(format!("{}{OMITTED}", "x".repeat(2000)))]);
+        let (fitted, count) = fit_request(request, 1000).unwrap();
+        assert_eq!(count, 1);
+        assert!(input_size(&fitted) <= 750);
     }
 
     #[test]

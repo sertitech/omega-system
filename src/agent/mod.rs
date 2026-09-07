@@ -93,7 +93,7 @@ unresolved questions. Reply with the summary text only.";
 /// where the next turn's text rides in a trailing tool-result message), so
 /// cutting there would separate a `tool_result` from its `tool_use`, which
 /// the API rejects. Cutting only at group starts makes orphans impossible.
-fn compaction_cut(messages: &[TurnMessage]) -> Option<usize> {
+fn compaction_cut(messages: &[TurnMessage], keep: usize) -> Option<usize> {
     let starts: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -106,7 +106,7 @@ fn compaction_cut(messages: &[TurnMessage]) -> Option<usize> {
         })
         .map(|(i, _)| i)
         .collect();
-    (starts.len() > KEEP_RECENT_TURN_GROUPS).then(|| starts[starts.len() - KEEP_RECENT_TURN_GROUPS])
+    (starts.len() > keep).then(|| starts[starts.len() - keep])
 }
 
 /// Join a message's `Text` blocks into one string, ignoring every other block
@@ -857,6 +857,10 @@ impl Agent {
     /// concerns — prompt-cache breakpoints, the string-or-blocks content shape —
     /// are the adapter's job, not the loop's.
     fn build_request(&self) -> TurnRequest {
+        self.build_request_with_summary(self.compacted_summary.as_deref())
+    }
+
+    fn build_request_with_summary(&self, summary: Option<&str>) -> TurnRequest {
         let has_tools = !self.tools.is_empty();
 
         // Append the tool-selection policy to the system prompt when tools exist.
@@ -870,7 +874,7 @@ impl Agent {
         // The rolling compaction summary rides in the system prompt, after the
         // configured text (see the `compacted_summary` field for why it is not
         // a message).
-        let system = match (system, &self.compacted_summary) {
+        let system = match (system, summary) {
             (Some(text), Some(summary)) => Some(format!(
                 "{text}\n\n## Earlier conversation (summarized)\n{summary}"
             )),
@@ -1259,17 +1263,28 @@ impl Agent {
     /// Summaries run between user turns, using measured usage and the current
     /// raw history size. Within a turn, every outbound request independently
     /// fits its tool-result text to the budget without changing the history.
-    fn maybe_compact(&mut self, out: &mut dyn Write) -> Result<(), AgentError> {
+    fn maybe_compact(&mut self, input: &str, out: &mut dyn Write) -> Result<(), AgentError> {
         let limit = self.config.context_token_limit as u64;
-        if (self.last_input_tokens as u64) * 100 < limit * COMPACT_THRESHOLD_PERCENT
-            && (context::input_size(&self.build_request()) as u64) * 100
-                < limit * COMPACT_THRESHOLD_PERCENT
-        {
+        let mut prospective = self.build_request();
+        context::append_input(&mut prospective.messages, input);
+        let oversized = context::input_size(&prospective)
+            > context::input_budget(&prospective, self.config.context_token_limit);
+        if (self.last_input_tokens as u64) * 100 < limit * COMPACT_THRESHOLD_PERCENT && !oversized {
             return Ok(());
         }
-        // Nothing droppable (the history is all recent groups): skip. The
-        // oversized context rides until enough turns exist to compact.
-        let Some(cut) = compaction_cut(&self.messages) else {
+        // Preserve two recent groups normally. When immutable prompt content
+        // cannot fit, allow one older complete group to be summarized rather
+        // than preventing the next user turn from making any progress.
+        let cut = compaction_cut(&self.messages, KEEP_RECENT_TURN_GROUPS).or_else(|| {
+            if oversized
+                && context::fit_request(prospective, self.config.context_token_limit).is_err()
+            {
+                compaction_cut(&self.messages, 1)
+            } else {
+                None
+            }
+        });
+        let Some(cut) = cut else {
             return Ok(());
         };
 
@@ -1313,6 +1328,13 @@ impl Agent {
             .summarize(&request)
             .or_else(|_| self.summarize(&request))
             .map_err(AgentError::Api)?;
+        // Verify the replacement before discarding its source. An oversized
+        // summary or incoming prompt must leave the full old history available
+        // for /save or a narrower follow-up.
+        let mut prospective = self.build_request_with_summary(Some(&summary));
+        prospective.messages.drain(..cut);
+        context::append_input(&mut prospective.messages, input);
+        context::fit_request(prospective, self.config.context_token_limit)?;
         self.compacted_summary = Some(summary);
         self.messages.drain(..cut);
         // The post-compaction size is unmeasurable until the next response
@@ -1380,7 +1402,7 @@ impl Agent {
         // un-compact and re-overflow), so a failed turn rolls back to the
         // *compacted* history. A compaction failure surfaces here, before the
         // input is recorded.
-        self.maybe_compact(out)?;
+        self.maybe_compact(input, out)?;
 
         // Snapshot for a possible rollback. The new input either pushes a fresh
         // user message or coalesces into a trailing user message a preserved
@@ -1400,15 +1422,7 @@ impl Agent {
         // which Anthropic's alternating-role contract rejects. Coalesce the
         // text into that trailing message instead (a user message may carry
         // both tool_result and text blocks).
-        match self.messages.last_mut() {
-            Some(last) if last.role == Role::User => {
-                last.content.push(Block::Text(input.to_string()));
-            }
-            _ => self.messages.push(TurnMessage {
-                role: Role::User,
-                content: vec![Block::Text(input.to_string())],
-            }),
-        }
+        context::append_input(&mut self.messages, input);
 
         let result = self.run_loop(out);
 
@@ -1625,9 +1639,7 @@ impl Agent {
         if shortened > 0 {
             self.meta_line(
                 out,
-                format_args!(
-                    "context: shortened {shortened} tool results; full results retained in session"
-                ),
+                format_args!("context: shortened {shortened} tool results in outgoing request"),
             );
         }
         Ok(request)
@@ -5517,13 +5529,13 @@ mod tests {
 
     #[test]
     fn compaction_cut_empty_history_is_none() {
-        assert!(compaction_cut(&[]).is_none());
+        assert!(compaction_cut(&[], KEEP_RECENT_TURN_GROUPS).is_none());
     }
 
     #[test]
     fn compaction_cut_single_group_is_none() {
         let msgs = vec![user_msg("q0"), assistant_msg("a0")];
-        assert!(compaction_cut(&msgs).is_none());
+        assert!(compaction_cut(&msgs, KEEP_RECENT_TURN_GROUPS).is_none());
     }
 
     #[test]
@@ -5535,7 +5547,7 @@ mod tests {
             user_msg("q1"),
             assistant_msg("a1"),
         ];
-        assert!(compaction_cut(&msgs).is_none());
+        assert!(compaction_cut(&msgs, KEEP_RECENT_TURN_GROUPS).is_none());
     }
 
     #[test]
@@ -5547,7 +5559,7 @@ mod tests {
             msgs.push(user_msg(&format!("q{i}")));
             msgs.push(assistant_msg(&format!("a{i}")));
         }
-        assert_eq!(compaction_cut(&msgs), Some(4));
+        assert_eq!(compaction_cut(&msgs, KEEP_RECENT_TURN_GROUPS), Some(4));
     }
 
     #[test]
@@ -5565,7 +5577,7 @@ mod tests {
             user_msg("q2"),
             assistant_msg("a2"),
         ];
-        assert_eq!(compaction_cut(&msgs), Some(4));
+        assert_eq!(compaction_cut(&msgs, KEEP_RECENT_TURN_GROUPS), Some(4));
     }
 
     #[test]
@@ -5595,7 +5607,7 @@ mod tests {
             user_msg("q3"),
             assistant_msg("a3"),
         ];
-        assert_eq!(compaction_cut(&msgs), Some(2));
+        assert_eq!(compaction_cut(&msgs, KEEP_RECENT_TURN_GROUPS), Some(2));
     }
 
     #[test]
@@ -5902,6 +5914,49 @@ mod tests {
     }
 
     #[test]
+    fn compaction_recovers_a_prospective_request_at_the_actual_input_budget() {
+        for (groups, reply_bytes, max_tokens, incoming_bytes) in
+            [(2, 4000, 64, 8), (3, 1800, 5000, 8), (3, 2100, 64, 2000)]
+        {
+            let provider = MockProvider::new(vec![text_stream("done")]).with_send_text("summary");
+            let summaries = provider.send_log();
+            let streams = provider.stream_log();
+            let mut config = test_config(None);
+            config.context_token_limit = 10_000;
+            config.max_tokens = max_tokens;
+            let mut agent = Agent::new(Box::new(provider), config, vec![]);
+            for i in 0..groups {
+                agent.messages.push(user_msg(&format!("q{i}")));
+                agent.messages.push(assistant_msg(&"a".repeat(reply_bytes)));
+            }
+            agent.last_input_tokens = 500;
+            agent
+                .run(&"q".repeat(incoming_bytes), &mut Vec::new())
+                .unwrap();
+            assert_eq!(summaries.borrow().len(), 1);
+            assert_eq!(streams.borrow().len(), 1);
+            let streams = streams.borrow();
+            assert!(context::input_size(&streams[0]) <= context::input_budget(&streams[0], 10_000));
+            assert_eq!(agent.compacted_summary.as_deref(), Some("summary"));
+        }
+    }
+
+    #[test]
+    fn oversized_summary_does_not_discard_original_history() {
+        let provider = MockProvider::new(vec![]).with_send_text(&"s".repeat(10_000));
+        let log = provider.stream_log();
+        let mut agent = compaction_agent(Box::new(provider), 10_000);
+        agent.last_input_tokens = 8000;
+        let before = agent.session();
+        assert!(matches!(
+            agent.run("next", &mut Vec::new()),
+            Err(AgentError::ContextLimit(10_000))
+        ));
+        assert_eq!(agent.session(), before);
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
     fn tool_loop_checks_large_real_file_before_continuing() {
         use crate::tools::{read_file::ReadFileTool, sandbox::Sandbox};
         let directory = tempfile::tempdir().unwrap();
@@ -5940,7 +5995,7 @@ mod tests {
         assert!(
             String::from_utf8(output)
                 .unwrap()
-                .contains("full results retained in session")
+                .contains("shortened 1 tool results in outgoing request")
         );
     }
 
