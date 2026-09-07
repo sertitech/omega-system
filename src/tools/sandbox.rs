@@ -144,10 +144,19 @@ impl Sandbox {
     }
 
     /// Whether `resolved` is a shielded global file for the automated-write
-    /// floor: the `.env` credentials or the `config.json` that seeds the next
-    /// session's confirmation policy.
+    /// floor: credentials, configuration, and the personal instruction and
+    /// repository-consent files that seed the next session's trusted inputs.
     pub fn is_protected_write(&self, resolved: &Path) -> bool {
-        self.protected_matches(resolved, &[".env", "config.json"])
+        self.protected_matches(
+            resolved,
+            &[
+                ".env",
+                "config.json",
+                "AGENTS.md",
+                "trusted.json",
+                "trusted.lock",
+            ],
+        )
     }
 
     /// The shared key: `resolved`'s parent is the canonical protected home and
@@ -443,6 +452,17 @@ mod tests {
         // The global config.json holds no secrets — write-floored, not read-shielded.
         assert!(!sb.is_protected_read(&config));
         assert!(sb.is_protected_write(&config));
+    }
+
+    #[test]
+    fn personal_instructions_and_repository_consent_require_the_write_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sb, home) = sandbox_with_home(dir.path());
+        for name in ["AGENTS.md", "trusted.json", "trusted.lock"] {
+            assert!(sb.is_protected_write(&home.join(name)));
+            assert!(!sb.is_protected_read(&home.join(name)));
+            assert!(!sb.is_protected_write(&dir.path().join(name)));
+        }
     }
 
     #[test]

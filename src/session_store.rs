@@ -244,7 +244,7 @@ impl SessionStore {
 /// literal `-` in the input can ever be confused with an escape marker, so
 /// distinct paths always produce distinct keys. `/a/b` → `-2Fa-2Fb`,
 /// `/a-b` → `-2Fa-2Db`, `/a b` → `-2Fa-20b` — three keys, no collision.
-fn project_key(root: &Path) -> String {
+pub(crate) fn project_key(root: &Path) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut key = String::new();
     for &byte in root.as_os_str().as_bytes() {
