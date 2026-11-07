@@ -9,11 +9,11 @@
 use super::sandbox::Sandbox;
 use super::{MAX_RESPONSE_BYTES, ToolDef, shell_guardrails, truncate_response};
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -50,29 +50,64 @@ fn optional_str<'a>(input: &'a serde_json::Value, field: &str) -> Result<Option<
     }
 }
 
-/// Read a child's output stream on a dedicated thread, so the child never
-/// blocks on a full pipe while we poll for exit. Capture is capped one byte
-/// past the response limit (enough for `truncate_response` to detect
-/// overflow); the remainder is drained and discarded.
-fn drain(stream: impl Read + Send + 'static) -> JoinHandle<std::io::Result<Vec<u8>>> {
-    std::thread::spawn(move || {
-        let mut stream = stream;
-        let mut buf = Vec::new();
-        stream
-            .by_ref()
-            .take(MAX_RESPONSE_BYTES as u64 + 1)
-            .read_to_end(&mut buf)?;
-        std::io::copy(&mut stream, &mut std::io::sink())?;
-        Ok(buf)
-    })
+/// A bounded capture of a nonblocking pipe. Both streams are polled alongside
+/// the child, since descendants can retain their write ends after its exit.
+/// One extra byte beyond the response limit lets truncation detect overflow.
+struct Output<'a> {
+    stream: &'a mut dyn Read,
+    bytes: Vec<u8>,
+    eof: bool,
 }
 
-fn collect(handle: JoinHandle<std::io::Result<Vec<u8>>>) -> Result<String, String> {
-    let bytes = handle
-        .join()
-        .map_err(|_| "output reader thread panicked".to_string())?
-        .map_err(|e| format!("failed to read command output: {e}"))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+impl<'a> Output<'a> {
+    fn new(stream: &'a mut dyn Read) -> Self {
+        Self {
+            stream,
+            bytes: Vec::new(),
+            eof: false,
+        }
+    }
+
+    fn poll(&mut self) -> Result<bool, String> {
+        if self.eof {
+            return Ok(true);
+        }
+        let mut chunk = [0; 8192];
+        // Bound work even when a writer continuously fills the pipe, so it
+        // cannot starve cancellation, the deadline, or the other stream.
+        for _ in 0..16 {
+            match self.stream.read(&mut chunk) {
+                Ok(0) => {
+                    self.eof = true;
+                    return Ok(true);
+                }
+                Ok(n) => {
+                    let keep = n.min(MAX_RESPONSE_BYTES + 1 - self.bytes.len());
+                    self.bytes.extend_from_slice(&chunk[..keep]);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("failed to read command output: {e}")),
+            }
+        }
+        Ok(false)
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+}
+
+fn nonblocking(fd: std::os::fd::RawFd) -> Result<(), String> {
+    // SAFETY: fcntl changes flags on an owned pipe; it has no memory effects.
+    // These freshly created pipes have no other mutable status flags to keep.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
+        return Err(format!(
+            "failed to configure command output: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 /// Kill the shell and everything in its process group. Killing only the
@@ -104,15 +139,11 @@ fn kill_group(child: &mut Child) {
 /// seam — tests script a failing waiter, production passes the `Child`.
 trait Waitable {
     fn poll(&mut self) -> std::io::Result<Option<ExitStatus>>;
-    fn kill(&mut self);
 }
 
 impl Waitable for Child {
     fn poll(&mut self) -> std::io::Result<Option<ExitStatus>> {
         self.try_wait()
-    }
-    fn kill(&mut self) {
-        kill_group(self);
     }
 }
 
@@ -126,34 +157,51 @@ enum WaitOutcome {
     Cancelled,
 }
 
-/// Poll for exit until `deadline`, killing the process group on timeout or on
-/// a pending cancellation (both return `Ok` so the caller can report partial
-/// output). A child that finished before the check reports its real exit
-/// status even when a cancellation raced it. A wait failure also kills the
-/// group (never leak a running child) and surfaces as `Err`.
+/// Wait for both child exit and pipe EOF. The caller kills the process group
+/// on every return, including setup/read/wait errors and successful commands
+/// whose descendants closed their pipes but kept running.
 fn wait_with_deadline(
     child: &mut dyn Waitable,
+    stdout: &mut Output<'_>,
+    stderr: &mut Output<'_>,
     deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<WaitOutcome, String> {
     loop {
-        match child.poll() {
-            Ok(Some(status)) => return Ok(WaitOutcome::Exited(status)),
-            Ok(None) if cancel.load(Ordering::Relaxed) => {
-                child.kill();
-                return Ok(WaitOutcome::Cancelled);
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                child.kill();
-                return Ok(WaitOutcome::TimedOut);
-            }
-            Ok(None) => std::thread::sleep(POLL_INTERVAL),
-            Err(e) => {
-                child.kill();
-                return Err(format!("failed to wait for command: {e}"));
-            }
+        let status = child
+            .poll()
+            .map_err(|e| format!("failed to wait for command: {e}"))?;
+        let stdout_done = stdout.poll()?;
+        let stderr_done = stderr.poll()?;
+        if let Some(status) = status
+            && stdout_done
+            && stderr_done
+        {
+            return Ok(WaitOutcome::Exited(status));
         }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(WaitOutcome::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Ok(WaitOutcome::TimedOut);
+        }
+        std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+fn capture_child(
+    child: &mut Child,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<(WaitOutcome, String), String> {
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    nonblocking(stdout.as_raw_fd())?;
+    nonblocking(stderr.as_raw_fd())?;
+    let mut stdout = Output::new(&mut stdout);
+    let mut stderr = Output::new(&mut stderr);
+    let outcome = wait_with_deadline(child, &mut stdout, &mut stderr, deadline, cancel)?;
+    Ok((outcome, combine_output(&stdout.text(), &stderr.text())))
 }
 
 /// Error text for a failed `/bin/sh` spawn. The shell always exists on the
@@ -262,14 +310,11 @@ impl ToolDef for ShellTool {
             // Own process group, so the timeout can kill the whole pipeline.
             .process_group(0);
 
-        let mut child = cmd.spawn().map_err(spawn_error)?;
-        let stdout = drain(child.stdout.take().expect("stdout is piped"));
-        let stderr = drain(child.stderr.take().expect("stderr is piped"));
-
         let deadline = Instant::now() + self.timeout;
-        let outcome = wait_with_deadline(&mut child, deadline, &self.cancel)?;
-
-        let output = combine_output(&collect(stdout)?, &collect(stderr)?);
+        let mut child = cmd.spawn().map_err(spawn_error)?;
+        let captured = capture_child(&mut child, deadline, &self.cancel);
+        kill_group(&mut child);
+        let (outcome, output) = captured?;
         match outcome {
             WaitOutcome::TimedOut => Err(truncate_response(format!(
                 "command timed out after {:?}\n{output}",
@@ -608,6 +653,72 @@ mod tests {
         assert!(within_deadline, "group kill took {elapsed:?}");
     }
 
+    fn assert_process_stopped(pid: &str) {
+        // A killed orphan may briefly remain a zombie before init reaps it.
+        std::thread::sleep(POLL_INTERVAL);
+        let status = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        assert!(status.status.success() || status.status.code() == Some(1));
+        assert!(status.stderr.is_empty());
+        let state = String::from_utf8(status.stdout).unwrap();
+        assert!(state.trim().is_empty() || state.trim().starts_with('Z'));
+    }
+
+    #[test]
+    fn run_timeout_covers_pipes_held_after_shell_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        // Exercise stdout and stderr separately: neither may keep collection
+        // alive after the shell reports success.
+        for redirect in ["2>/dev/null", ">/dev/null"] {
+            fs::write(
+                dir.path().join("background.sh"),
+                format!("sleep 5 {redirect} &\necho $!\nexit 0\n"),
+            )
+            .unwrap();
+            let start = Instant::now();
+            let err = run_cmd(&quick_timeout_tool(dir.path()), "sh background.sh").unwrap_err();
+            assert!(err.contains("timed out after 250ms"));
+            assert!(start.elapsed() < Duration::from_secs(2));
+            assert_process_stopped(err.lines().nth(1).unwrap());
+        }
+    }
+
+    #[test]
+    fn run_captures_descendant_output_before_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("background.sh"),
+            "(sleep 0.1; echo late; echo diagnostic >&2) &\nexit 0\n",
+        )
+        .unwrap();
+        let output = run_cmd(&tool_in(dir.path()), "sh background.sh").unwrap();
+        assert_eq!(output, "late\n\n[stderr]\ndiagnostic\n");
+    }
+
+    #[test]
+    fn run_cleans_up_descendants_that_closed_output() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("background.sh"),
+            "sleep 5 >/dev/null 2>&1 &\necho $!\nexit 0\n",
+        )
+        .unwrap();
+        let output = run_cmd(&tool_in(dir.path()), "sh background.sh").unwrap();
+        assert_process_stopped(output.trim());
+    }
+
+    #[test]
+    fn run_timeout_covers_continuous_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = Instant::now();
+        let err = run_cmd(&quick_timeout_tool(dir.path()), "yes x").unwrap_err();
+        assert!(err.contains("timed out after 250ms"));
+        assert!(err.ends_with("[truncated at 100 KB]"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
     // ── run: cancellation ──
 
     #[test]
@@ -629,21 +740,40 @@ mod tests {
         assert!(within_deadline, "cancellation kill took {elapsed:?}");
     }
 
+    #[test]
+    fn run_cancellation_covers_pipes_held_after_shell_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("background.sh"),
+            "sleep 5 &\necho $!\nexit 0\n",
+        )
+        .unwrap();
+        let cancel = no_cancel();
+        let tool = ShellTool::new(sandbox_in(dir.path()), Arc::clone(&cancel));
+        let cancellation = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancel.store(true, Ordering::Relaxed);
+        });
+        let start = Instant::now();
+        let result = run_cmd(&tool, "sh background.sh");
+        cancellation.join().unwrap();
+        let err = result.unwrap_err();
+        assert!(err.contains("command cancelled by user"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_process_stopped(err.lines().nth(1).unwrap());
+    }
+
     // ── wait_with_deadline ──
 
     /// Scripted `Waitable` — drives every arm of the deadline loop, including
     /// the wait-failure arm a real `Child` can never produce.
     struct ScriptedWait {
         polls: Vec<std::io::Result<Option<ExitStatus>>>,
-        killed: bool,
     }
 
     impl ScriptedWait {
         fn new(polls: Vec<std::io::Result<Option<ExitStatus>>>) -> Self {
-            Self {
-                polls,
-                killed: false,
-            }
+            Self { polls }
         }
     }
 
@@ -651,9 +781,20 @@ mod tests {
         fn poll(&mut self) -> std::io::Result<Option<ExitStatus>> {
             self.polls.remove(0)
         }
-        fn kill(&mut self) {
-            self.killed = true;
-        }
+    }
+
+    fn wait(
+        child: &mut dyn Waitable,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<WaitOutcome, String> {
+        wait_with_deadline(
+            child,
+            &mut Output::new(&mut std::io::empty()),
+            &mut Output::new(&mut std::io::empty()),
+            deadline,
+            cancel,
+        )
     }
 
     /// A hermetic `ExitStatus` — raw wait status 0 is success on every Unix.
@@ -666,9 +807,8 @@ mod tests {
     fn wait_returns_immediate_exit() {
         let mut child = ScriptedWait::new(vec![Ok(Some(exit_ok()))]);
         let deadline = Instant::now() + Duration::from_secs(5);
-        let outcome = wait_with_deadline(&mut child, deadline, &no_cancel()).unwrap();
+        let outcome = wait(&mut child, deadline, &no_cancel()).unwrap();
         assert!(matches!(outcome, WaitOutcome::Exited(s) if s.success()));
-        assert!(!child.killed);
     }
 
     #[test]
@@ -676,29 +816,24 @@ mod tests {
         // First poll finds the child still running — the loop sleeps and asks again.
         let mut child = ScriptedWait::new(vec![Ok(None), Ok(Some(exit_ok()))]);
         let deadline = Instant::now() + Duration::from_secs(5);
-        let outcome = wait_with_deadline(&mut child, deadline, &no_cancel()).unwrap();
+        let outcome = wait(&mut child, deadline, &no_cancel()).unwrap();
         assert!(matches!(outcome, WaitOutcome::Exited(s) if s.success()));
-        assert!(!child.killed);
     }
 
     #[test]
-    fn wait_kills_on_timeout() {
+    fn wait_reports_timeout() {
         let mut child = ScriptedWait::new(vec![Ok(None)]);
-        let outcome = wait_with_deadline(&mut child, Instant::now(), &no_cancel()).unwrap();
+        let outcome = wait(&mut child, Instant::now(), &no_cancel()).unwrap();
         assert!(matches!(outcome, WaitOutcome::TimedOut));
-        assert!(child.killed);
     }
 
     #[test]
-    fn wait_kills_on_cancellation_before_the_deadline() {
-        // A pending cancellation kills the still-running group with the
-        // deadline nowhere near — and reports Cancelled, not TimedOut.
+    fn wait_reports_cancellation_before_the_deadline() {
         let mut child = ScriptedWait::new(vec![Ok(None)]);
         let deadline = Instant::now() + Duration::from_secs(5);
         let cancel = AtomicBool::new(true);
-        let outcome = wait_with_deadline(&mut child, deadline, &cancel).unwrap();
+        let outcome = wait(&mut child, deadline, &cancel).unwrap();
         assert!(matches!(outcome, WaitOutcome::Cancelled));
-        assert!(child.killed);
     }
 
     #[test]
@@ -708,36 +843,102 @@ mod tests {
         let mut child = ScriptedWait::new(vec![Ok(Some(exit_ok()))]);
         let deadline = Instant::now() + Duration::from_secs(5);
         let cancel = AtomicBool::new(true);
-        let outcome = wait_with_deadline(&mut child, deadline, &cancel).unwrap();
+        let outcome = wait(&mut child, deadline, &cancel).unwrap();
         assert!(matches!(outcome, WaitOutcome::Exited(s) if s.success()));
-        assert!(!child.killed);
     }
 
     #[test]
-    fn wait_kills_on_wait_failure() {
+    fn wait_reports_wait_failure() {
         let mut child = ScriptedWait::new(vec![Err(std::io::Error::other("no such child"))]);
         let deadline = Instant::now() + Duration::from_secs(5);
-        let err = wait_with_deadline(&mut child, deadline, &no_cancel()).unwrap_err();
+        let err = wait(&mut child, deadline, &no_cancel()).unwrap_err();
         assert!(err.contains("failed to wait for command: no such child"));
-        assert!(child.killed);
     }
 
-    // ── collect ──
+    // ── output capture ──
 
     #[test]
-    fn collect_surfaces_reader_panic() {
-        let handle = std::thread::spawn(|| -> std::io::Result<Vec<u8>> { panic!("boom") });
-        let err = collect(handle).unwrap_err();
-        assert_eq!(err, "output reader thread panicked");
-    }
-
-    #[test]
-    fn collect_surfaces_reader_error() {
-        let handle = std::thread::spawn(|| -> std::io::Result<Vec<u8>> {
-            Err(std::io::Error::other("pipe burst"))
-        });
-        let err = collect(handle).unwrap_err();
+    fn output_surfaces_reader_error() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("pipe burst"))
+            }
+        }
+        let mut child = ScriptedWait::new(vec![Ok(None)]);
+        let err = wait_with_deadline(
+            &mut child,
+            &mut Output::new(&mut Broken),
+            &mut Output::new(&mut std::io::empty()),
+            Instant::now(),
+            &no_cancel(),
+        )
+        .unwrap_err();
         assert_eq!(err, "failed to read command output: pipe burst");
+    }
+
+    #[test]
+    fn output_retries_interrupted_reads() {
+        struct InterruptedOnce(bool, std::io::Cursor<&'static [u8]>);
+        impl Read for InterruptedOnce {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.0) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.1.read(buf)
+            }
+        }
+        let mut reader = InterruptedOnce(true, std::io::Cursor::new(b"ok"));
+        let mut output = Output::new(&mut reader);
+        assert!(output.poll().unwrap());
+        assert_eq!(output.text(), "ok");
+    }
+
+    #[test]
+    fn wait_does_not_finish_until_both_pipes_close() {
+        struct OpenPipe;
+        impl Read for OpenPipe {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+        for cancelled in [false, true] {
+            let mut child = ScriptedWait::new(vec![Ok(Some(exit_ok()))]);
+            let outcome = wait_with_deadline(
+                &mut child,
+                &mut Output::new(&mut std::io::empty()),
+                &mut Output::new(&mut OpenPipe),
+                Instant::now(),
+                &AtomicBool::new(cancelled),
+            )
+            .unwrap();
+            assert_eq!(matches!(outcome, WaitOutcome::Cancelled), cancelled);
+            assert_eq!(matches!(outcome, WaitOutcome::TimedOut), !cancelled);
+        }
+    }
+
+    #[test]
+    fn output_continuous_writer_is_bounded_and_capped() {
+        let mut reader = std::io::repeat(b'x');
+        let mut output = Output::new(&mut reader);
+        assert!(!output.poll().unwrap());
+        assert_eq!(output.bytes.len(), MAX_RESPONSE_BYTES + 1);
+        assert!(!output.poll().unwrap());
+        assert_eq!(output.bytes.len(), MAX_RESPONSE_BYTES + 1);
+    }
+
+    #[test]
+    fn output_closed_stream_is_not_read_again() {
+        let mut reader = std::io::empty();
+        let mut output = Output::new(&mut reader);
+        assert!(output.poll().unwrap());
+        assert!(output.poll().unwrap());
+    }
+
+    #[test]
+    fn nonblocking_rejects_invalid_descriptor() {
+        let err = nonblocking(-1).unwrap_err();
+        assert!(err.starts_with("failed to configure command output:"));
     }
 
     // ── error text helpers ──

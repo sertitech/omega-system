@@ -1,8 +1,15 @@
 name: CI
 
-# Runs on demand. README.md documents the equivalent local gate.
+# Run the same gate locally and for every proposed or merged change.
 on:
+  pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 # Least privilege: the workflow only reads repository content.
 permissions:

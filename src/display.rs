@@ -8,7 +8,7 @@
 //! here first.
 //!
 //! **The classification is shared; the policies are deliberately not.** All
-//! four consult the same predicates — [`char::is_control`] (the C0 + DEL + C1
+//! five consult the same predicates — [`char::is_control`] (the C0 + DEL + C1
 //! set) and [`is_invisible_format`] (the bidi/zero-width set) — but they differ
 //! on two axes that are per-channel choices, not accidents:
 //!
@@ -22,9 +22,13 @@
 //!   [`escape_control_chars`] scrub `\n` too (a newline forges a fake status
 //!   line or an extra tool-output row).
 //!
-//! Keeping the four side by side is the point: a future change to the shared
-//! character set touches one file, and a fifth policy cannot be added without
-//! showing up beside the other four.
+//! Exact file-review text uses [`escape_for_review`] instead: controls and
+//! invisible formats become visible escape sequences, and literal backslashes
+//! are doubled so two different edits cannot collapse onto the same display.
+//! The preview adds its own line structure after escaping each content line.
+//!
+//! Keeping every policy side by side means shared character-set changes touch
+//! one file and the table test pins their differences.
 
 /// The invisible-format characters every display policy scrubs. None render as
 /// a visible glyph, yet each can hide, reorder, or smuggle text past the
@@ -137,13 +141,35 @@ pub(crate) fn escape_control_chars(s: &str) -> String {
         .collect()
 }
 
+/// Render an exact review line: controls and invisible formats use visible Rust
+/// escapes, and literal backslashes are doubled so escaped and literal bytes
+/// cannot look identical in an approval preview. Line structure is added by
+/// the preview renderer after escaping each individual line.
+pub(crate) fn escape_for_review(s: &str) -> String {
+    let mut escaped = String::new();
+    for c in s.chars() {
+        if c.is_control() || is_invisible_format(c) || c == '\\' {
+            escaped.extend(c.escape_default());
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const FFFD: char = '\u{FFFD}';
 
-    /// The full contract for all four policies in one table: each row is a
+    #[test]
+    fn review_escapes_keep_literal_and_control_text_distinct() {
+        assert_eq!(escape_for_review("\n\r\t\\n"), "\\n\\r\\t\\\\n");
+        assert_eq!(escape_for_review("a\u{202e}b"), "a\\u{202e}b");
+    }
+
+    /// The shared contract for every display policy in one table: each row is a
     /// character class, each policy a column. Control (C0/DEL/C1) and
     /// invisible-format characters are replaced by every policy, differing only
     /// in the glyph; ordinary characters (including the non-control U+00A0 and
@@ -189,6 +215,7 @@ mod tests {
             // `?` channels: operator-facing agent status lines.
             assert_eq!(sanitize_for_display(&s), "x?y");
             assert_eq!(sanitize_multiline(&s), "x?y");
+            assert_eq!(escape_for_review(&s), format!("x{}y", c.escape_default()));
             // The shared classification flags every one.
             assert!(c.is_control() || is_invisible_format(c));
         }
@@ -227,6 +254,7 @@ mod tests {
             assert_eq!(escape_control_chars(&s), s);
             assert_eq!(sanitize_for_display(&s), s);
             assert_eq!(sanitize_multiline(&s), s);
+            assert_eq!(escape_for_review(&s), s);
             assert!(!c.is_control() && !is_invisible_format(c));
         }
 

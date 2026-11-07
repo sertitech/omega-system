@@ -1,6 +1,6 @@
 use super::sandbox::Sandbox;
 use super::{MAX_RESPONSE_BYTES, ToolDef, truncate_response};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 
 const BINARY_CHECK_BYTES: usize = 8 * 1024; // 8 KB
 
@@ -30,6 +30,72 @@ fn read_error(e: std::io::Error) -> String {
     format!("cannot read file: {e}")
 }
 
+/// Parse the optional range without silently accepting zero, fractions, or strings.
+fn line_range(input: &serde_json::Value) -> Result<Option<(u64, u64)>, String> {
+    let mut values = [1, u64::MAX];
+    let mut ranged = false;
+    for (i, name) in ["offset", "limit"].iter().enumerate() {
+        if let Some(value) = input.get(name) {
+            values[i] = value
+                .as_u64()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| format!("{name} must be a positive integer"))?;
+            ranged = true;
+        }
+    }
+    Ok(ranged.then_some((values[0], values[1])))
+}
+
+/// Scan buffered chunks rather than collecting lines: even a skipped or selected
+/// line larger than memory costs only the reader buffer and the output cap.
+fn read_text(mut reader: impl BufRead, range: Option<(u64, u64)>) -> std::io::Result<String> {
+    let (offset, limit) = range.unwrap_or((1, u64::MAX));
+    for _ in 1..offset {
+        if reader.skip_until(b'\n')? == 0 {
+            return Ok(format!("[EOF; no lines at offset {offset}]"));
+        }
+    }
+    let mut body = Vec::new();
+    let mut lines = 0;
+    let mut ends_with_newline = false;
+    while lines < limit && body.len() <= MAX_RESPONSE_BYTES {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            break;
+        }
+        let end = chunk
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(chunk.len(), |i| i + 1);
+        let take = end.min(MAX_RESPONSE_BYTES + 1 - body.len());
+        body.extend_from_slice(&chunk[..take]);
+        ends_with_newline = chunk[take - 1] == b'\n';
+        lines += u64::from(ends_with_newline);
+        reader.consume(take);
+    }
+    let decoded = String::from_utf8_lossy(&body);
+    let truncated = decoded.len() > MAX_RESPONSE_BYTES;
+    let text = truncate_response(decoded.into_owned());
+    if range.is_none() {
+        return Ok(text);
+    }
+    if body.is_empty() {
+        return Ok(format!("[EOF; no lines at offset {offset}]"));
+    }
+    if truncated {
+        return Ok(format!(
+            "[from line {offset}; byte limit reached; final displayed line may be incomplete]\n{text}"
+        ));
+    }
+    let end_line = offset.saturating_add(lines + u64::from(!ends_with_newline) - 1);
+    let status = if reader.fill_buf()?.is_empty() {
+        "EOF".to_string()
+    } else {
+        format!("more lines; next offset {}", end_line.saturating_add(1))
+    };
+    Ok(format!("[lines {offset}-{end_line}; {status}]\n{text}"))
+}
+
 impl ToolDef for ReadFileTool {
     fn name(&self) -> &str {
         "read_file"
@@ -37,6 +103,7 @@ impl ToolDef for ReadFileTool {
 
     fn description(&self) -> &str {
         "Read the contents of a text file. Returns an error for binary files. \
+         Use offset (1-based line) and limit (line count) to read large files in sections. \
          Prefer this over web_fetch for local files. \
          Do NOT use to check if a file exists — use list_directory on the parent instead."
     }
@@ -48,10 +115,22 @@ impl ToolDef for ReadFileTool {
                 "path": {
                     "type": "string",
                     "description": "Path to the file to read (relative to working directory)"
+                },
+                "offset": {
+                    "type": "integer", "minimum": 1,
+                    "description": "First line to read (1-based; defaults to 1)"
+                },
+                "limit": {
+                    "type": "integer", "minimum": 1,
+                    "description": "Maximum lines to return; output is also capped at 100 KB"
                 }
             },
             "required": ["path"]
         })
+    }
+
+    fn validate(&self, input: &serde_json::Value) -> Result<(), String> {
+        line_range(input).map(|_| ())
     }
 
     fn cost(&self) -> u8 {
@@ -71,6 +150,7 @@ impl ToolDef for ReadFileTool {
             .as_str()
             .ok_or("missing required field: path")?;
 
+        let range = line_range(&input)?;
         let resolved = self.sandbox.resolve(path)?;
 
         // The global credentials file is shielded even though this tool is
@@ -103,23 +183,8 @@ impl ToolDef for ReadFileTool {
             return Err(format!("file appears to be binary: {path}"));
         }
 
-        // Read up to MAX_RESPONSE_BYTES + 1 to detect truncation, then
-        // truncate. This caps memory usage rather than reading the whole file.
-        let remaining = MAX_RESPONSE_BYTES + 1 - head.len();
-        let mut rest = Vec::new();
-        file.take(remaining as u64)
-            .read_to_end(&mut rest)
-            .map_err(read_error)?;
-
-        head.extend(rest);
-
-        // Lossy decode: the null-byte gate above already rejects true
-        // binaries, so what reaches here is text with at most stray invalid
-        // bytes (e.g. Latin-1) — decode them to U+FFFD rather than error,
-        // the project-wide non-UTF-8 policy shared with shell and read_capped.
-        let body = String::from_utf8_lossy(&head).into_owned();
-
-        Ok(truncate_response(body))
+        let reader = BufReader::new(std::io::Cursor::new(head).chain(file));
+        read_text(reader, range).map_err(read_error)
     }
 }
 
@@ -375,6 +440,115 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("shielded"), "got: {err}");
+    }
+
+    #[test]
+    fn line_ranges_validate_and_report_continuation_and_eof() {
+        for input in [
+            serde_json::json!({"offset": 0}),
+            serde_json::json!({"limit": -1}),
+            serde_json::json!({"offset": 1.5}),
+            serde_json::json!({"limit": "2"}),
+            serde_json::json!({"limit": null}),
+        ] {
+            let tool = ReadFileTool::new(Sandbox::unbounded());
+            assert!(
+                tool.validate(&input)
+                    .unwrap_err()
+                    .contains("positive integer")
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("text"), "one\ntwo\nthree").unwrap();
+        let tool = ReadFileTool::new(sandbox_in(dir.path()));
+        for (fields, expected) in [
+            (
+                serde_json::json!({"offset": 2, "limit": 1}),
+                "[lines 2-2; more lines; next offset 3]\ntwo\n",
+            ),
+            (serde_json::json!({"offset": 3}), "[lines 3-3; EOF]\nthree"),
+            (
+                serde_json::json!({"limit": 3}),
+                "[lines 1-3; EOF]\none\ntwo\nthree",
+            ),
+            (
+                serde_json::json!({"offset": 4}),
+                "[EOF; no lines at offset 4]",
+            ),
+            (
+                serde_json::json!({"offset": 5}),
+                "[EOF; no lines at offset 5]",
+            ),
+        ] {
+            let mut input = fields;
+            input["path"] = serde_json::json!("text");
+            assert!(tool.validate(&input).is_ok());
+            assert_eq!(tool.run(input, &mut std::io::sink()).unwrap(), expected);
+        }
+        assert!(
+            tool.run(
+                serde_json::json!({"path": "text", "offset": 0}),
+                &mut std::io::sink()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            read_text(&b""[..], Some((1, 2))).unwrap(),
+            "[EOF; no lines at offset 1]"
+        );
+        assert_eq!(
+            read_text(&b"one\n"[..], Some((1, 1))).unwrap(),
+            "[lines 1-1; EOF]\none\n"
+        );
+    }
+
+    #[test]
+    fn range_reads_tail_beyond_default_cap_and_skips_a_huge_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = format!("{}\ntail one\ntail two\n", "a".repeat(200 * 1024));
+        fs::write(dir.path().join("large"), &content).unwrap();
+        let tool = ReadFileTool::new(sandbox_in(dir.path()));
+        assert_eq!(
+            tool.run(
+                serde_json::json!({"path": "large", "offset": 2, "limit": 2}),
+                &mut std::io::sink()
+            )
+            .unwrap(),
+            "[lines 2-3; EOF]\ntail one\ntail two\n"
+        );
+        let result = tool
+            .run(
+                serde_json::json!({"path": "large", "limit": 1}),
+                &mut std::io::sink(),
+            )
+            .unwrap();
+        assert!(result.contains("final displayed line may be incomplete"));
+        assert!(result.ends_with("[truncated at 100 KB]"));
+        assert!(result.len() < MAX_RESPONSE_BYTES + 200);
+        let data = "é".repeat(MAX_RESPONSE_BYTES);
+        assert!(
+            read_text(data.as_bytes(), Some((1, 1)))
+                .unwrap()
+                .contains("byte limit reached")
+        );
+    }
+
+    #[test]
+    fn range_read_propagates_io_errors_when_skipping_or_collecting() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected read failure"))
+            }
+        }
+        for offset in [1, 2] {
+            assert!(
+                read_text(BufReader::new(Broken), Some((offset, 1)))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected read failure")
+            );
+        }
     }
 
     #[test]
