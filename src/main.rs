@@ -3,6 +3,7 @@ use omega_system::agent::{
 };
 use omega_system::cli::{CliArgs, USAGE, select_initial_session};
 use omega_system::config::Config;
+use omega_system::instructions;
 use omega_system::provider;
 use omega_system::repl::{
     History, TtyEditor, install_sigint_cancel, persist_sink, run_repl, stdin_stdout_are_ttys,
@@ -104,6 +105,23 @@ fn main() {
     // Omega from `$HOME` would otherwise place `~/.omega-system/.env` inside
     // the sandbox. Inert when there is no home directory (the builder decides).
     let protected_home = home.as_ref().map(|h| h.join(".omega-system"));
+    let interactive = stdin_stdout_are_ttys();
+    let instructions = match instructions::discover(
+        protected_home.as_deref(),
+        sandbox.root().expect("rooted sandbox"),
+        interactive,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr().lock(),
+    ) {
+        Ok(discovered) => discovered,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    for notice in &instructions.notices {
+        eprintln!("{notice}");
+    }
     let sandbox = sandbox.with_protected_home(protected_home.as_deref());
 
     // The named session store (`/save` / `/load` / `/sessions`), rooted under
@@ -171,7 +189,7 @@ fn main() {
         provider_kind: config.provider,
         model: config.model,
         max_tokens: config.max_tokens,
-        system: config.system,
+        system: instructions.compose(config.system),
         context_token_limit: config.context_token_limit,
         effort: config.effort,
         max_turns: config.max_turns,
@@ -184,11 +202,6 @@ fn main() {
     agent.set_budget_ledger(budget);
     agent.set_concurrency(concurrency);
     agent.set_confirm_policy(confirm);
-
-    // Computed once, before the session selection: an interactive session
-    // (stdin and stdout both TTYs) gets the raw-mode editor below, and a bare
-    // `--resume` with several saves gets the picker; a piped run gets neither.
-    let interactive = stdin_stdout_are_ttys();
 
     // Startup session selection (the covered branch in `cli`): `--resume`
     // restores a named or newest save from the store — and, for a bare
