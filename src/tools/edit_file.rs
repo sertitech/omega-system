@@ -1,5 +1,5 @@
-use super::ToolDef;
 use super::sandbox::Sandbox;
+use super::{ToolDef, file_preview};
 use crate::atomic_write::atomic_write_text;
 
 pub struct EditFileTool {
@@ -19,6 +19,22 @@ impl EditFileTool {
 /// own unit test.
 fn stat_error(e: std::io::Error) -> String {
     format!("cannot stat file: {e}")
+}
+
+fn replacement(content: &str, old_str: &str, new_str: &str, path: &str) -> Result<String, String> {
+    let count = content.matches(old_str).count();
+    if count == 0 {
+        return Err(format!(
+            "old_str not found in {path} (stale context or typo?)"
+        ));
+    }
+    if count > 1 {
+        return Err(format!(
+            "old_str matches {count} locations in {path} (ambiguous — provide more surrounding context)"
+        ));
+    }
+
+    Ok(content.replacen(old_str, new_str, 1))
 }
 
 impl ToolDef for EditFileTool {
@@ -87,6 +103,21 @@ impl ToolDef for EditFileTool {
         input["path"].as_str().map(|p| format!("editing {p}"))
     }
 
+    fn confirmation_preview(&self, input: &serde_json::Value) -> Result<Option<String>, String> {
+        self.validate(input)?;
+        let path = input["path"].as_str().unwrap();
+        let resolved = self.sandbox.resolve(path)?;
+        let before =
+            file_preview::read_existing(&resolved)?.ok_or("file disappeared before preview")?;
+        let after = replacement(
+            &before,
+            input["old_str"].as_str().unwrap(),
+            input["new_str"].as_str().unwrap(),
+            path,
+        )?;
+        file_preview::render(path, Some(&before), &after).map(Some)
+    }
+
     fn run(
         &self,
         input: serde_json::Value,
@@ -117,19 +148,7 @@ impl ToolDef for EditFileTool {
         let content = std::fs::read_to_string(&resolved)
             .map_err(|e| format!("cannot read '{}': {e}", resolved.display()))?;
 
-        let count = content.matches(old_str).count();
-        if count == 0 {
-            return Err(format!(
-                "old_str not found in {path} (stale context or typo?)"
-            ));
-        }
-        if count > 1 {
-            return Err(format!(
-                "old_str matches {count} locations in {path} (ambiguous — provide more surrounding context)"
-            ));
-        }
-
-        let updated = content.replacen(old_str, new_str, 1);
+        let updated = replacement(&content, old_str, new_str, path)?;
 
         // Commit through a temp file + rename so a mid-write failure cannot
         // truncate the file we just read.
@@ -146,6 +165,40 @@ mod tests {
 
     fn sandbox_in(dir: &std::path::Path) -> Sandbox {
         Sandbox::rooted(dir.to_path_buf()).unwrap()
+    }
+
+    #[test]
+    fn edit_preview_shows_actual_context_and_rejects_invalid_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("file"), "before\nhello world\nafter\n").unwrap();
+        let tool = EditFileTool::new(sandbox_in(dir.path()));
+        let mut input = serde_json::json!({"path": "file", "old_str": "world", "new_str": "rust"});
+        let preview = tool.confirmation_preview(&input).unwrap().unwrap();
+        assert!(preview.contains("-     2 | hello world\n+     2 | hello rust"));
+        assert!(preview.contains("      1 | before"));
+        assert!(preview.contains("      3 | after"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("file")).unwrap(),
+            "before\nhello world\nafter\n"
+        );
+        input["old_str"] = serde_json::json!("absent");
+        assert!(
+            tool.confirmation_preview(&input)
+                .unwrap_err()
+                .contains("not found")
+        );
+        input["old_str"] = serde_json::json!("e");
+        assert!(
+            tool.confirmation_preview(&input)
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+        assert!(tool.confirmation_preview(&serde_json::json!({})).is_err());
+        input["path"] = serde_json::json!("absent");
+        assert!(tool.confirmation_preview(&input).is_err());
+        fs::create_dir(dir.path().join("directory")).unwrap();
+        input["path"] = serde_json::json!("directory");
+        assert!(tool.confirmation_preview(&input).is_err());
     }
 
     #[test]
