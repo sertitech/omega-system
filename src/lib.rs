@@ -5,6 +5,7 @@ pub mod cli;
 pub mod command;
 pub mod config;
 pub(crate) mod display;
+pub mod instructions;
 pub mod markdown;
 pub mod openai;
 pub mod provider;

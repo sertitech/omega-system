@@ -62,6 +62,20 @@ defaults, and a `config.json` in the working directory can override individual
 fields. Credentials are resolved from the process environment, then `./.env`,
 then `~/.omega-system/.env`; API keys never belong in JSON configuration.
 
+Omega loads personal instructions from `~/.omega-system/AGENTS.md`, followed
+by `AGENTS.md` at the project launch directory's root. Repository instructions require
+one-time interactive consent, defaulting to no; the decision is stored per
+canonical project path in `~/.omega-system/trusted.json`. Piped sessions load
+only previously trusted projects. Delete a project's entry to reconsider its
+decision. Trust covers the project, so changing its instructions does not
+prompt again. Keep `~/.omega-system/trusted.lock` in place; it coordinates
+consent updates between running Omega processes.
+
+Each instruction file must be a regular UTF-8 file of at most 32 KiB;
+symlinks are rejected. Omega does not search parent or nested directories.
+Instructions supplement the configured system prompt, cannot change tool
+confirmation policy, and are not automatically inherited by subagents.
+
 Launch Omega from the project it should work in:
 
 ```sh
