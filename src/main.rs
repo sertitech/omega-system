@@ -11,6 +11,7 @@ use omega_system::repl::{
 use omega_system::session_store::SessionStore;
 use omega_system::tools::default_tools;
 use omega_system::tools::sandbox::Sandbox;
+use omega_system::tools::skill::SkillTool;
 use omega_system::tools::subagent::TaskTool;
 use std::path::Path;
 use std::sync::Arc;
@@ -135,6 +136,12 @@ fn main() {
 
     let firecrawl_key = omega_system::load_env_var("FIRECRAWL_API_KEY");
     let mut tools = default_tools(sandbox.clone(), firecrawl_key.clone(), Arc::clone(&cancel));
+
+    // The `skill` tool is registered only when discovery indexed a skill —
+    // with none, the tool list the model sees stays byte-identical to before.
+    if !instructions.skills().is_empty() {
+        tools.push(Box::new(SkillTool::new(instructions.skills().to_vec())));
+    }
 
     // The process-wide tool-call budget ledger, shared by the top-level agent
     // and every subagent the `task` tool spawns, so children draw against the

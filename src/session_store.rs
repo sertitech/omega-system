@@ -266,18 +266,23 @@ pub(crate) fn project_key(root: &Path) -> String {
 /// `..` never begins a name), and no dotfiles. The bounded character set also
 /// keeps the `<name>.json` filename portable.
 fn validate_name(name: &str) -> Result<(), String> {
-    let valid = !name.is_empty()
-        && !name.starts_with('.')
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-    if valid {
+    if is_valid_name(name) {
         Ok(())
     } else {
         Err(format!(
             "invalid session name '{name}': use letters, digits, '.', '_', or '-', with no leading dot"
         ))
     }
+}
+
+/// The shared name shape behind [`validate_name`], reused for skill names so a
+/// skill and a save follow one portable, traversal-free charset.
+pub(crate) fn is_valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Render the age of a save as a coarse `Ns`/`Nm`/`Nh`/`Nd ago` bucket — a

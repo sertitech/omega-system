@@ -10,11 +10,14 @@ use crate::session::{SESSION_VERSION, Session};
 use crate::turn::{Block, Role, StopReason, ToolSpec, TurnMessage, TurnRequest};
 use std::io::Write;
 
-const TOOL_POLICY: &str = "\
+/// The tool-selection policy, split around tier 2 so `skill` joins that tier
+/// only when the tool is registered; without it the text is unchanged.
+const TOOL_POLICY_HEAD: &str = "\
 \n\n## Tool selection policy\n\
 Prefer the cheapest tool that can answer the question:\n\
 1. Your own knowledge (free — no tool call needed)\n\
-2. read_file / list_directory / search_files (local, fast, read-only)\n\
+2. read_file / list_directory / search_files";
+const TOOL_POLICY_TAIL: &str = " (local, fast, read-only)\n\
 3. edit_file / write_file (local, mutates files)\n\
 4. web_fetch (network, targeted — use when you have a specific URL)\n\
 5. web_search (external API, slow, noisy — last resort only)\n\
@@ -159,6 +162,15 @@ impl Agent {
             .collect()
     }
 
+    fn tool_policy(&self) -> String {
+        let skill = self
+            .tools
+            .iter()
+            .any(|t| t.name() == crate::tools::skill::NAME);
+        let skill = if skill { " / skill" } else { "" };
+        format!("{TOOL_POLICY_HEAD}{skill}{TOOL_POLICY_TAIL}")
+    }
+
     /// Build the normalized request for the next turn. Provider-neutral: the
     /// system prompt is plain text and messages are carried verbatim. Wire
     /// concerns — prompt-cache breakpoints, the string-or-blocks content shape —
@@ -172,8 +184,8 @@ impl Agent {
 
         // Append the tool-selection policy to the system prompt when tools exist.
         let system = match (&self.config.system, has_tools) {
-            (Some(text), true) => Some(format!("{text}{TOOL_POLICY}")),
-            (None, true) => Some(TOOL_POLICY.trim_start().to_string()),
+            (Some(text), true) => Some(format!("{text}{}", self.tool_policy())),
+            (None, true) => Some(self.tool_policy().trim_start().to_string()),
             (Some(text), false) => Some(text.clone()),
             (None, false) => None,
         };
@@ -623,6 +635,49 @@ mod tests {
         let system = req.system.expect("system present");
         assert!(system.starts_with("You are helpful."));
         assert!(system.contains("Tool selection policy"));
+    }
+
+    #[test]
+    fn tool_policy_lists_skill_in_tier_two_only_when_registered() {
+        let tier = |tools| {
+            let mut agent = agent_with_tools(tools);
+            agent.messages.push(user_msg("hi"));
+            agent.build_request().system.unwrap()
+        };
+        let without = tier(vec![mock_tool("echo", "ok")]);
+        assert!(without.starts_with("## Tool selection policy\n"));
+        assert!(without.contains(
+            "\n2. read_file / list_directory / search_files (local, fast, read-only)\n3. edit_file"
+        ));
+        let with = tier(vec![mock_tool("skill", "ok")]);
+        assert!(with.contains(
+            "\n2. read_file / list_directory / search_files / skill (local, fast, read-only)\n3. edit_file"
+        ));
+        assert_eq!(with.replace(" / skill", ""), without);
+    }
+
+    #[test]
+    fn skills_index_precedes_tool_policy_and_compaction_summary() {
+        let mut agent = Agent::new(
+            Box::new(MockProvider::new(vec![])),
+            test_config(Some(
+                "operator\n\n## Project instructions (AGENTS.md)\n…\n\n## Skills\n…",
+            )),
+            vec![mock_tool("skill", "ok")],
+        );
+        agent.compacted_summary = Some("earlier".to_string());
+        agent.messages.push(user_msg("hi"));
+        let system = agent.build_request().system.unwrap();
+        let order = [
+            "operator",
+            "## Project instructions",
+            "## Skills",
+            "## Tool selection policy",
+            "/ skill (local",
+            "## Earlier conversation (summarized)\nearlier",
+        ]
+        .map(|marker| system.find(marker).unwrap());
+        assert!(order.is_sorted(), "{system}");
     }
 
     #[test]
