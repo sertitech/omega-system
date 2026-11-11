@@ -1,0 +1,47 @@
+#!/bin/sh
+# check — the merge gate, in one place. CI, hooks/pre-push, and a developer at
+# a terminal all run this script, so the gate cannot drift between them.
+#
+# Needs: cargo install cargo-llvm-cov --locked --version 0.8.7
+#
+# No-deps: pure POSIX sh.
+
+set -eu
+
+cd "$(dirname "$0")"
+
+# Coverage scope: 100% of hermetic lines. The excluded files are only those
+# unreachable without live secrets or a real terminal:
+#   - src/main.rs       thin process wiring; everything interactive lives
+#                       behind the run_repl seam, which is covered
+#   - src/**/*_live.rs  the raw ureq/stdin/confirm tails plus the #[ignore]'d
+#                       live-API tests
+# That exclusion is a standing blind spot — code added to an excluded file
+# evades the gate silently. Rule: an excluded file may hold only the raw
+# transport/TTY wiring and live tests; anything else belongs in a covered
+# module.
+uncovered='(^|/)src/main\.rs$|_live\.rs$'
+
+echo "check: cargo fmt --check"
+cargo fmt --check
+
+echo "check: cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
+
+# Hermetic: live-API tests are #[ignore]'d, so no secrets and no network.
+echo "check: cargo test --locked"
+cargo test --locked
+
+echo "check: coverage (scoped 100% line gate)"
+if ! cargo llvm-cov --summary-only \
+	--ignore-filename-regex "$uncovered" \
+	--fail-under-lines 100; then
+	# The summary only names the file; name the exact lines too. Reuses the
+	# failed run's profdata.
+	cargo llvm-cov report \
+		--ignore-filename-regex "$uncovered" \
+		--show-missing-lines | sed -n '/^Uncovered Lines:/,$p'
+	exit 1
+fi
+
+echo "check: all checks passed."

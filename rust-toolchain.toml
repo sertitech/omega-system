@@ -1,0 +1,7 @@
+# The single source of truth for the Rust version: rustup reads this file for
+# every cargo invocation in the tree, locally and in CI. llvm-tools-preview
+# backs the coverage gate (cargo-llvm-cov).
+[toolchain]
+channel = "1.94.1"
+profile = "minimal"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
