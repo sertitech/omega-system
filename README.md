@@ -139,17 +139,13 @@ Pull requests and pushes to `main` run the gate on macOS and Linux. To run the
 same gate locally:
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --locked
-cargo llvm-cov --summary-only \
-  --ignore-filename-regex '(^|/)src/main\.rs$|_live\.rs$' \
-  --fail-under-lines 100
+./check
 ```
 
-The coverage scope excludes only thin process wiring and live API/TTY tails;
-validation, parsing, state transitions, retries, tool behavior, and interactive
-dispatch remain on the covered side.
+It runs `cargo fmt --check`, clippy with warnings denied, the hermetic tests,
+and the coverage gate. The coverage scope excludes only thin process wiring
+and live API/TTY tails; validation, parsing, state transitions, retries, tool
+behavior, and interactive dispatch remain on the covered side.
 
 ## License
 
