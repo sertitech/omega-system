@@ -6,6 +6,7 @@ pub mod sandbox;
 pub mod search_files;
 pub mod shell;
 pub mod shell_guardrails;
+pub mod skill;
 pub mod subagent;
 pub mod web_fetch;
 pub mod web_live;
